@@ -88,3 +88,40 @@ git push
 
 - `.env`는 커밋하지 않습니다.
 - 계정 정보는 로그에 저장하지 않습니다.
+
+## 6) 로컬 LLM RAG(무료/로그인 불필요)
+
+종합평가 문제 자동풀이를 위해 Ollama + 로컬 RAG를 지원합니다.
+
+준비:
+
+```bash
+# Ollama 설치 후 모델 받기
+ollama pull nomic-embed-text
+ollama pull qwen2.5:7b-instruct
+```
+
+`.env` 예시:
+
+```dotenv
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+RAG_DOCS_DIR=rag_data
+RAG_INDEX_PATH=rag/index.json
+RAG_EMBED_MODEL=nomic-embed-text
+RAG_GENERATE_MODEL=qwen2.5:7b-instruct
+RAG_TOP_K=6
+RAG_CONF_THRESHOLD=0.72
+```
+
+실행 순서(Streamlit UI):
+
+1. `RAG 문서 폴더`에 PDF/TXT/MD 파일을 넣습니다.
+2. `RAG 인덱스 생성` 버튼으로 인덱스를 만듭니다.
+3. `종합평가 LLM 풀이(RAG)` 버튼으로 한 문제씩 풉니다.
+
+참고:
+
+- 신뢰도(`RAG 신뢰도 임계치`)보다 낮으면 자동풀이를 중단하도록 설계되었습니다.
+- 신뢰도 미달 시 재질문 1회를 추가 시도합니다.
+- 시험 문항 DOM 추출 실패 시 OCR 폴백을 시도합니다. (`tesseract` 설치 시 활성)
+- Ollama가 실행 중이 아니면 인덱싱/풀이가 실패합니다.
