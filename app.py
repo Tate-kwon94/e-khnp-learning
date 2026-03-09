@@ -95,6 +95,15 @@ def main() -> None:
         manual_lesson_limit = int(
             st.number_input("반복할 차시 수", min_value=1, max_value=200, value=3, step=1)
         )
+    exam_probe_limit = int(
+        st.number_input("종합평가 탐침 최대 문항 수", min_value=1, max_value=60, value=12, step=1)
+    )
+    timefill_check_interval_min = int(
+        st.number_input("학습시간 부족 체크 간격(분)", min_value=1, max_value=60, value=10, step=1)
+    )
+    timefill_check_limit = int(
+        st.number_input("학습시간 부족 체크 최대 횟수", min_value=1, max_value=72, value=24, step=1)
+    )
 
     st.subheader("설정 확인")
     st.write(
@@ -108,7 +117,7 @@ def main() -> None:
         }
     )
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
     with col1:
         run_login = st.button("로그인 테스트 실행", use_container_width=True)
     with col2:
@@ -118,6 +127,10 @@ def main() -> None:
     with col4:
         run_complete_lesson = st.button("첫 과목 모든 차시 완료(반복)", use_container_width=True)
     with col5:
+        run_exam_probe = st.button("종합평가 텍스트 탐침", use_container_width=True)
+    with col6:
+        run_completion_flow = st.button("수료 순서 자동(진도→시험→시간)", use_container_width=True)
+    with col7:
         if st.button("로그 초기화", use_container_width=True):
             st.session_state.logs = []
 
@@ -175,6 +188,35 @@ def main() -> None:
         result = automator.login_and_complete_first_course_lesson(
             stop_rule=stop_rule,
             manual_lesson_limit=manual_lesson_limit,
+        )
+        if result.success:
+            st.success(result.message)
+        else:
+            st.error(result.message)
+        append_log(f"결과: {result.message} / url={result.current_url}")
+
+    if run_exam_probe:
+        append_log("로그인 + 첫 과목 강의실 진입 + 종합평가 텍스트 탐침을 시작합니다.")
+        settings.user_id = user_id_input.strip()
+        settings.user_password = user_password_input
+        settings.headless = not show_browser
+        automator = EKHNPAutomator(settings, log_fn=append_log)
+        result = automator.login_and_probe_comprehensive_exam(max_questions=exam_probe_limit)
+        if result.success:
+            st.success(result.message)
+        else:
+            st.error(result.message)
+        append_log(f"결과: {result.message} / url={result.current_url}")
+
+    if run_completion_flow:
+        append_log("수료 순서 자동 실행을 시작합니다. (진도율 → 시험평가 → 학습시간 보충)")
+        settings.user_id = user_id_input.strip()
+        settings.user_password = user_password_input
+        settings.headless = not show_browser
+        automator = EKHNPAutomator(settings, log_fn=append_log)
+        result = automator.login_and_run_completion_workflow(
+            check_interval_minutes=timefill_check_interval_min,
+            max_timefill_checks=timefill_check_limit,
         )
         if result.success:
             st.success(result.message)
