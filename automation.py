@@ -26,6 +26,7 @@ class EKHNPAutomator:
         self.settings = settings
         self.log_fn = log_fn
         self._detected_total_lessons: Optional[int] = None
+        self._exam_gate_blocked: bool = False
 
     def _log(self, message: str) -> None:
         if self.log_fn:
@@ -255,6 +256,353 @@ class EKHNPAutomator:
                 context.close()
                 browser.close()
 
+    def login_and_probe_comprehensive_exam(self, max_questions: int = 12) -> LoginResult:
+        if not self.settings.user_id or not self.settings.user_password:
+            return LoginResult(False, "환경변수에 EKHNP_USER_ID / EKHNP_USER_PASSWORD를 설정하세요.")
+
+        safe_max_questions = max(1, min(max_questions, 60))
+        self._log("브라우저를 시작합니다.")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=self.settings.headless)
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_default_timeout(self.settings.timeout_ms)
+            dialog_messages: list[str] = []
+            page.on("dialog", lambda dialog: self._handle_dialog(dialog, dialog_messages))
+
+            try:
+                page.goto(self.settings.login_url, wait_until="commit")
+                self._log(f"로그인 페이지 이동: {self.settings.login_url}")
+                if not self._wait_login_form_ready(page):
+                    return LoginResult(False, "로그인 폼 로딩 타임아웃", page.url)
+
+                id_candidates = [
+                    "#j_userId",
+                    'input[name="j_userId"]',
+                    'input[placeholder*="사번 또는 아이디"]',
+                    'input[name="id"]',
+                    'input[name="userId"]',
+                    'input[type="text"]',
+                ]
+                pw_candidates = [
+                    "#j_password",
+                    'input[name="j_password"]',
+                    'input[placeholder*="비밀번호를 입력해 주세요"]',
+                    'input[name="password"]',
+                    'input[name="userPw"]',
+                    'input[type="password"]',
+                ]
+                submit_candidates = [
+                    "a.btn-login",
+                    'a[onclick*="doLogin"]',
+                    'button[type="submit"]',
+                    'input[type="submit"]',
+                    'button:has-text("로그인")',
+                    'a:has-text("로그인")',
+                ]
+
+                id_filled = self._fill_first_visible(page, id_candidates, self.settings.user_id)
+                pw_filled = self._fill_first_visible(page, pw_candidates, self.settings.user_password)
+                submitted = self._click_first_visible(page, submit_candidates)
+
+                if not id_filled or not pw_filled:
+                    return LoginResult(False, "로그인 입력창을 찾지 못했습니다.", page.url)
+                if not submitted:
+                    now_url = page.url
+                    if (
+                        "login/process.do" in now_url
+                        or "param=success" in now_url
+                        or "loginpage.do" not in now_url
+                    ):
+                        self._log("로그인 버튼 감지는 실패했지만 로그인 처리 URL 변화를 감지했습니다.")
+                    else:
+                        return LoginResult(False, "로그인 버튼을 찾지 못했습니다.", page.url)
+
+                login_result = self._wait_login_result(page, dialog_messages)
+                if not login_result.success:
+                    return login_result
+
+                status_result = self._open_learning_status(page)
+                if not status_result.success:
+                    return status_result
+
+                classroom_result, classroom_page = self._open_first_course_classroom_internal(page)
+                if not classroom_result.success or classroom_page is None:
+                    return classroom_result
+
+                self._refresh_classroom_page(classroom_page)
+                progress_status = self._extract_learning_progress_status(classroom_page)
+                current_percent = int(progress_status.get("current_percent", 0))
+                if 0 < current_percent < 80:
+                    return LoginResult(
+                        False,
+                        f"종합평가 응시 조건 미달: 학습진도율 {current_percent}% (최소 80% 필요)",
+                        classroom_page.url,
+                    )
+                if current_percent >= 80:
+                    self._log(f"종합평가 응시 조건 충족: 학습진도율 {current_percent}%")
+                else:
+                    self._log("학습진도율 수치 판독 실패(0%). 응시 버튼 탐색으로 진행합니다.")
+
+                exam_page = self._open_comprehensive_exam_popup(classroom_page)
+                if exam_page is None:
+                    return LoginResult(False, "종합평가 응시 팝업을 찾지 못했습니다.", classroom_page.url)
+
+                probe = self._probe_exam_question_stream(exam_page, max_questions=safe_max_questions)
+                dom_ok = probe.get("dom_readable_count", 0)
+                visited = probe.get("visited_count", 0)
+                ocr_needed = max(0, visited - dom_ok)
+                total_hint = probe.get("total_hint")
+
+                total_hint_msg = f" / total_hint={total_hint}" if isinstance(total_hint, int) and total_hint > 0 else ""
+                return LoginResult(
+                    True,
+                    f"종합평가 텍스트 탐침 완료: DOM판독 {dom_ok}/{visited}, OCR필요추정 {ocr_needed}{total_hint_msg}",
+                    exam_page.url,
+                )
+            except PlaywrightTimeoutError:
+                return LoginResult(False, "타임아웃이 발생했습니다.", page.url)
+            except Exception as exc:  # noqa: BLE001
+                return LoginResult(False, f"오류 발생: {exc}", page.url)
+            finally:
+                context.close()
+                browser.close()
+
+    def login_and_run_completion_workflow(
+        self,
+        check_interval_minutes: int = 10,
+        max_timefill_checks: int = 24,
+        safety_max_lessons: int = 80,
+    ) -> LoginResult:
+        if not self.settings.user_id or not self.settings.user_password:
+            return LoginResult(False, "환경변수에 EKHNP_USER_ID / EKHNP_USER_PASSWORD를 설정하세요.")
+
+        interval_ms = max(1, check_interval_minutes) * 60 * 1000
+        check_limit = max(1, min(max_timefill_checks, 72))
+
+        self._log("브라우저를 시작합니다.")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=self.settings.headless)
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_default_timeout(self.settings.timeout_ms)
+            dialog_messages: list[str] = []
+            page.on("dialog", lambda dialog: self._handle_dialog(dialog, dialog_messages))
+
+            try:
+                page.goto(self.settings.login_url, wait_until="commit")
+                self._log(f"로그인 페이지 이동: {self.settings.login_url}")
+                if not self._wait_login_form_ready(page):
+                    return LoginResult(False, "로그인 폼 로딩 타임아웃", page.url)
+
+                id_candidates = [
+                    "#j_userId",
+                    'input[name="j_userId"]',
+                    'input[placeholder*="사번 또는 아이디"]',
+                    'input[name="id"]',
+                    'input[name="userId"]',
+                    'input[type="text"]',
+                ]
+                pw_candidates = [
+                    "#j_password",
+                    'input[name="j_password"]',
+                    'input[placeholder*="비밀번호를 입력해 주세요"]',
+                    'input[name="password"]',
+                    'input[name="userPw"]',
+                    'input[type="password"]',
+                ]
+                submit_candidates = [
+                    "a.btn-login",
+                    'a[onclick*="doLogin"]',
+                    'button[type="submit"]',
+                    'input[type="submit"]',
+                    'button:has-text("로그인")',
+                    'a:has-text("로그인")',
+                ]
+
+                id_filled = self._fill_first_visible(page, id_candidates, self.settings.user_id)
+                pw_filled = self._fill_first_visible(page, pw_candidates, self.settings.user_password)
+                submitted = self._click_first_visible(page, submit_candidates)
+
+                if not id_filled or not pw_filled:
+                    return LoginResult(False, "로그인 입력창을 찾지 못했습니다.", page.url)
+                if not submitted:
+                    now_url = page.url
+                    if (
+                        "login/process.do" in now_url
+                        or "param=success" in now_url
+                        or "loginpage.do" not in now_url
+                    ):
+                        self._log("로그인 버튼 감지는 실패했지만 로그인 처리 URL 변화를 감지했습니다.")
+                    else:
+                        return LoginResult(False, "로그인 버튼을 찾지 못했습니다.", page.url)
+
+                login_result = self._wait_login_result(page, dialog_messages)
+                if not login_result.success:
+                    return login_result
+
+                status_result = self._open_learning_status(page)
+                if not status_result.success:
+                    return status_result
+
+                classroom_result, classroom_page = self._open_first_course_classroom_internal(page)
+                if not classroom_result.success or classroom_page is None:
+                    return classroom_result
+
+                # 1) 학습진도율 수료기준 도달 전까지 차시 진행
+                self._log("1단계: 학습하기를 통해 학습진도율을 수료기준까지 올립니다.")
+                learning_page = self._start_learning_from_progress_panel(classroom_page)
+                if learning_page is None:
+                    return LoginResult(False, "학습창을 열지 못해 진도율 단계 시작 실패", classroom_page.url)
+
+                completed_lessons = 0
+                while completed_lessons < safety_max_lessons:
+                    complete_result = self._complete_lesson_steps(learning_page)
+                    if not complete_result.success:
+                        return LoginResult(
+                            False,
+                            f"진도율 단계 중단: {complete_result.message}",
+                            complete_result.current_url,
+                        )
+                    completed_lessons += 1
+                    self._log(f"진도율 단계 누적 완료 차시: {completed_lessons}")
+                    if not complete_result.next_lesson_clicked:
+                        break
+                    learning_page.wait_for_timeout(2200)
+
+                self._refresh_classroom_page(classroom_page)
+                progress_status = self._extract_learning_progress_status(classroom_page)
+                if not progress_status["progress_ok"] or progress_status["incomplete_count"] > 0:
+                    self._log("학습진도율 기준 미충족 또는 미완료 차시 감지: 보완 학습을 시도합니다.")
+                    for retry in range(min(safety_max_lessons, 40)):
+                        if progress_status["progress_ok"] and progress_status["incomplete_count"] <= 0:
+                            break
+                        self._log(f"미완료 차시 보완 시도 {retry + 1}")
+                        extra_page = self._open_incomplete_lesson_popup(classroom_page)
+                        if extra_page is None:
+                            break
+                        extra_result = self._complete_lesson_steps(extra_page)
+                        if not extra_result.success:
+                            return LoginResult(
+                                False,
+                                f"미완료 차시 보완 실패: {extra_result.message}",
+                                extra_result.current_url,
+                            )
+                        self._refresh_classroom_page(classroom_page)
+                        progress_status = self._extract_learning_progress_status(classroom_page)
+
+                    if not progress_status["progress_ok"] or progress_status["incomplete_count"] > 0:
+                        return LoginResult(
+                            False,
+                            "학습진도율 수료기준 미충족 또는 미완료 차시가 남아 있어 중단합니다.",
+                            classroom_page.url,
+                        )
+
+                # 2) 시험평가
+                self._log("2단계: 종합평가 응시를 진행합니다.")
+                exam_gate = self._extract_learning_progress_status(classroom_page)
+                exam_gate_percent = int(exam_gate.get("current_percent", 0))
+                if 0 < exam_gate_percent < 80:
+                    self._log(
+                        f"종합평가 응시 기준 미달 상태 감지: {exam_gate_percent}% (80% 이상 필요, 미완료 차시 보완 진행)"
+                    )
+                if exam_gate_percent >= 80:
+                    self._log(f"종합평가 응시 조건 충족: 학습진도율 {exam_gate_percent}%")
+                else:
+                    self._log("학습진도율 수치 판독 실패(0%). 응시 버튼 탐색으로 진행합니다.")
+                exam_page = self._open_comprehensive_exam_popup(classroom_page)
+                if exam_page is None and self._exam_gate_blocked:
+                    self._log("응시 제한 팝업 확인: 미완료 차시를 진행한 뒤 종합평가를 재시도합니다.")
+                    for retry in range(min(safety_max_lessons, 40)):
+                        self._refresh_classroom_page(classroom_page)
+                        exam_gate = self._extract_learning_progress_status(classroom_page)
+                        exam_gate_percent = int(exam_gate.get("current_percent", 0))
+                        if exam_gate_percent >= 80 and exam_gate["incomplete_count"] <= 0:
+                            break
+
+                        self._log(f"응시 조건 보완(미완료 차시) {retry + 1}")
+                        extra_page = self._open_incomplete_lesson_popup(classroom_page)
+                        if extra_page is None:
+                            break
+                        extra_result = self._complete_lesson_steps(extra_page)
+                        if not extra_result.success:
+                            return LoginResult(
+                                False,
+                                f"응시 조건 보완 실패: {extra_result.message}",
+                                extra_result.current_url,
+                            )
+
+                    self._refresh_classroom_page(classroom_page)
+                    exam_gate = self._extract_learning_progress_status(classroom_page)
+                    exam_gate_percent = int(exam_gate.get("current_percent", 0))
+                    if 0 < exam_gate_percent < 80:
+                        return LoginResult(
+                            False,
+                            f"종합평가 응시 조건 미달: 학습진도율 {exam_gate_percent}% (최소 80% 필요)",
+                            classroom_page.url,
+                        )
+                    exam_page = self._open_comprehensive_exam_popup(classroom_page)
+                if exam_page is None:
+                    return LoginResult(False, "종합평가 응시 팝업을 찾지 못했습니다.", classroom_page.url)
+
+                self._log("시험평가 완료를 대기합니다. (수동 풀이 또는 별도 자동풀이 가능)")
+                if not self._wait_exam_finished(exam_page, timeout_ms=60 * 60 * 1000):
+                    return LoginResult(False, "시험평가 완료를 확인하지 못했습니다.", exam_page.url)
+                self._log("시험평가 완료 신호를 감지했습니다.")
+
+                # 3) 학습시간 부족 시 1차시 재생 유지 + 10분 간격 체크
+                self._refresh_classroom_page(classroom_page)
+                time_status = self._extract_study_time_status(classroom_page)
+                progress_status = self._extract_learning_progress_status(classroom_page)
+                if not progress_status["progress_ok"] or progress_status["incomplete_count"] > 0:
+                    return LoginResult(
+                        False,
+                        "시험평가 후 학습진도율 기준 미충족(미완료 차시 존재 포함)으로 중단합니다.",
+                        classroom_page.url,
+                    )
+                if time_status["requirement_known"] and time_status["shortage_seconds"] <= 0:
+                    return LoginResult(
+                        True,
+                        "수료 시나리오 완료: 진도율/시험평가 이후 학습시간도 수료기준 충족",
+                        classroom_page.url,
+                    )
+
+                self._log("3단계: 학습시간이 부족해 1차시 재생 유지 모드로 진입합니다.")
+                keepalive_page = self._open_first_lesson_popup_for_timefill(classroom_page)
+                if keepalive_page is None:
+                    return LoginResult(False, "학습시간 보충용 1차시 학습창을 열지 못했습니다.", classroom_page.url)
+
+                for idx in range(check_limit):
+                    self._log(f"학습시간 보충 대기: {idx + 1}/{check_limit} (다음 확인 {check_interval_minutes}분 후)")
+                    keepalive_page.wait_for_timeout(interval_ms)
+                    self._refresh_classroom_page(classroom_page)
+                    time_status = self._extract_study_time_status(classroom_page)
+                    progress_status = self._extract_learning_progress_status(classroom_page)
+                    if (
+                        progress_status["progress_ok"]
+                        and progress_status["incomplete_count"] <= 0
+                        and time_status["requirement_known"]
+                        and time_status["shortage_seconds"] <= 0
+                    ):
+                        return LoginResult(
+                            True,
+                            "수료 시나리오 완료: 학습시간 부족분이 충족되었습니다.",
+                            classroom_page.url,
+                        )
+
+                return LoginResult(
+                    False,
+                    "학습시간 보충 체크 제한 횟수에 도달했습니다. (기준 충족 미확인)",
+                    classroom_page.url,
+                )
+            except PlaywrightTimeoutError:
+                return LoginResult(False, "타임아웃이 발생했습니다.", page.url)
+            except Exception as exc:  # noqa: BLE001
+                return LoginResult(False, f"오류 발생: {exc}", page.url)
+            finally:
+                context.close()
+                browser.close()
+
     def login_and_complete_first_course_lesson(
         self,
         stop_rule: str = "auto",
@@ -442,57 +790,283 @@ class EKHNPAutomator:
 
     def _extract_total_lessons_from_classroom_buttons(self, page: Page) -> Optional[int]:
         try:
-            total = page.evaluate(
+            stats = page.evaluate(
                 """
                 () => {
                     const isVisible = (el) => {
                       const r = el.getBoundingClientRect();
                       return r.width > 0 && r.height > 0;
                     };
-                    const getLabel = (el) => ((el.textContent || el.value || '').trim());
+                    const normalize = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
+                    const getLabel = (el) => normalize(el.textContent || el.value || '');
                     const isLessonBtn = (el) => {
                       const txt = getLabel(el);
                       return txt === '학습하기' || txt === '이어 학습하기' || txt === '이어학습하기';
                     };
-
-                    // 1) 차시 목록 테이블 기준으로 우선 계산 (가장 정확)
-                    const rowElems = Array.from(
-                      document.querySelectorAll(
-                        'tr a, tr button, tr input[type="button"], tr input[type="submit"], tr span'
-                      )
-                    ).filter((el) => isVisible(el) && isLessonBtn(el));
-                    if (rowElems.length > 0) {
-                      const rowSet = new Set();
-                      for (const el of rowElems) {
-                        const tr = el.closest('tr');
-                        if (!tr) continue;
-                        const key = (tr.innerText || '').replace(/\\s+/g, ' ').trim();
-                        if (key) rowSet.add(key);
+                    const toInt = (v) => (Number.isFinite(v) ? Math.trunc(v) : 0);
+                    const extractTotals = (text) => {
+                      const out = [];
+                      if (!text) return out;
+                      const totalPat = /총\\s*(\\d{1,3})\\s*차시/gi;
+                      let m;
+                      while ((m = totalPat.exec(text)) !== null) {
+                        out.push(toInt(parseInt(m[1], 10)));
                       }
-                      if (rowSet.size > 0) return rowSet.size;
-                      return rowElems.length;
+                      const ratioPat = /(\\d{1,3})\\s*\\/\\s*(\\d{1,3})/g;
+                      while ((m = ratioPat.exec(text)) !== null) {
+                        const cur = toInt(parseInt(m[1], 10));
+                        const tot = toInt(parseInt(m[2], 10));
+                        if (cur >= 1 && tot >= cur) out.push(tot);
+                      }
+                      return out.filter((n) => n >= 1 && n <= 400);
+                    };
+
+                    const result = {
+                      scopedLessonSectionLessonNoCount: 0,
+                      scopedLessonSectionNumberedCardCount: 0,
+                      scopedLessonSectionButtonRowCount: 0,
+                      scopedLessonSectionButtonCountMinPositive: 0,
+                      scopedLessonNoCount: 0,
+                      scopedButtonRowCount: 0,
+                      globalButtonCountRaw: 0,
+                      globalButtonCountAdjusted: 0,
+                      explicitTotalFromText: 0,
+                      explicitTotalFromScripts: 0,
+                    };
+
+                    // A) 명시적 총 차시 텍스트를 우선 탐지 (신뢰도 높음)
+                    const bodyText = normalize(document.body && document.body.innerText);
+                    const textTotals = extractTotals(bodyText);
+                    if (textTotals.length) {
+                      result.explicitTotalFromText = Math.max(...textTotals);
                     }
 
-                    // 2) 전체 페이지 기준 폴백: "모든 학습하기 개수 - 1" 보정
+                    // B) 스크립트 내 총 차시 힌트 탐지 (신뢰도 중상)
+                    const scriptTotals = [];
+                    for (const s of Array.from(document.querySelectorAll('script'))) {
+                      const txt = s.textContent || '';
+                      scriptTotals.push(...extractTotals(txt));
+                    }
+                    if (scriptTotals.length) {
+                      result.explicitTotalFromScripts = Math.max(...scriptTotals);
+                    }
+
+                    // C-1) "학습 차시" 섹션 기반 차시 행 탐지 (최우선)
+                    const findScopedCounts = (includeFn) => {
+                      const titleNodes = Array.from(document.querySelectorAll('div,span,strong,h1,h2,h3,h4'));
+                      const scopedCounts = [];
+                      for (const title of titleNodes) {
+                        const titleText = normalize(title.textContent);
+                        if (!includeFn(titleText)) continue;
+                        let container = title;
+                        for (let depth = 0; depth < 6 && container; depth++) {
+                          const rows = Array.from(container.querySelectorAll('tr'));
+                          const lessonNos = new Set();
+                          const buttonRows = new Set();
+                          const numberedCards = new Set();
+                          const lessonBtns = Array.from(
+                            container.querySelectorAll('a,button,input[type="button"],input[type="submit"],span')
+                          ).filter((el) => isVisible(el) && isLessonBtn(el));
+
+                          for (const btn of lessonBtns) {
+                            let node = btn;
+                            for (let up = 0; up < 8 && node; up++) {
+                              const txt = normalize(node.innerText || node.textContent || '');
+                              const m1 = txt.match(/(?:^|\\s)(\\d{1,3})\\s*[\\.|\\)]\\s*\\S+/);
+                              const m2 = txt.match(/(\\d{1,3})\\s*차시/);
+                              const m = m1 || m2;
+                              if (m) {
+                                numberedCards.add(m[1]);
+                                break;
+                              }
+                              node = node.parentElement;
+                            }
+                          }
+
+                          for (const tr of rows) {
+                            const rowText = normalize(tr.innerText || tr.textContent || '');
+                            const noMatch = rowText.match(/(\\d{1,3})\\s*차시/);
+                            if (noMatch) {
+                              lessonNos.add(noMatch[1]);
+                            }
+                            const btn = Array.from(
+                              tr.querySelectorAll('a,button,input[type="button"],input[type="submit"],span')
+                            ).find((el) => isVisible(el) && isLessonBtn(el));
+                            if (btn) {
+                              const rowKey = normalize(tr.innerText || tr.textContent || '');
+                              if (rowKey) buttonRows.add(rowKey);
+                            }
+                          }
+                          if (lessonNos.size > 0 || buttonRows.size > 0) {
+                            scopedCounts.push({
+                              lessonNoCount: lessonNos.size,
+                              numberedCardCount: numberedCards.size,
+                              buttonRowCount: buttonRows.size,
+                              lessonButtonCount: lessonBtns.length,
+                            });
+                          } else if (numberedCards.size > 0 || lessonBtns.length > 0) {
+                            scopedCounts.push({
+                              lessonNoCount: 0,
+                              numberedCardCount: numberedCards.size,
+                              buttonRowCount: 0,
+                              lessonButtonCount: lessonBtns.length,
+                            });
+                          }
+                          container = container.parentElement;
+                        }
+                      }
+                      return scopedCounts;
+                    };
+
+                    const lessonSectionCounts = findScopedCounts(
+                      (titleText) => titleText.includes('학습 차시') || titleText.includes('학습차시')
+                    );
+                    if (lessonSectionCounts.length) {
+                      result.scopedLessonSectionLessonNoCount = Math.max(
+                        ...lessonSectionCounts.map((item) => toInt(item.lessonNoCount))
+                      );
+                      result.scopedLessonSectionNumberedCardCount = Math.max(
+                        ...lessonSectionCounts.map((item) => toInt(item.numberedCardCount))
+                      );
+                      result.scopedLessonSectionButtonRowCount = Math.max(
+                        ...lessonSectionCounts.map((item) => toInt(item.buttonRowCount))
+                      );
+                      const positiveButtonCounts = lessonSectionCounts
+                        .map((item) => toInt(item.lessonButtonCount))
+                        .filter((n) => n > 0);
+                      if (positiveButtonCounts.length) {
+                        result.scopedLessonSectionButtonCountMinPositive = Math.min(...positiveButtonCounts);
+                      }
+                    }
+
+                    // C-2) "학습진행현황" 섹션 기반 차시 행 탐지 (보조)
+                    const titleNodes = Array.from(document.querySelectorAll('div,span,strong,h1,h2,h3,h4'));
+                    const scopedCounts = [];
+                    for (const title of titleNodes) {
+                      const titleText = normalize(title.textContent);
+                      if (!titleText.includes('학습진행현황')) continue;
+                      let container = title;
+                      for (let depth = 0; depth < 6 && container; depth++) {
+                        const rows = Array.from(container.querySelectorAll('tr'));
+                        const lessonNos = new Set();
+                        const buttonRows = new Set();
+                        for (const tr of rows) {
+                          const rowText = normalize(tr.innerText || tr.textContent || '');
+                          const noMatch = rowText.match(/(\\d{1,3})\\s*차시/);
+                          if (noMatch) {
+                            lessonNos.add(noMatch[1]);
+                          }
+                          const btn = Array.from(
+                            tr.querySelectorAll('a,button,input[type="button"],input[type="submit"],span')
+                          ).find((el) => isVisible(el) && isLessonBtn(el));
+                          if (btn) {
+                            const rowKey = normalize(tr.innerText || tr.textContent || '');
+                            if (rowKey) buttonRows.add(rowKey);
+                          }
+                        }
+                        if (lessonNos.size > 0 || buttonRows.size > 0) {
+                          scopedCounts.push({
+                            lessonNoCount: lessonNos.size,
+                            buttonRowCount: buttonRows.size,
+                          });
+                        }
+                        container = container.parentElement;
+                      }
+                    }
+                    if (scopedCounts.length) {
+                      result.scopedLessonNoCount = Math.max(
+                        ...scopedCounts.map((item) => toInt(item.lessonNoCount))
+                      );
+                      result.scopedButtonRowCount = Math.max(
+                        ...scopedCounts.map((item) => toInt(item.buttonRowCount))
+                      );
+                    }
+
+                    // D) 전체 페이지 기준 폴백: "모든 학습하기 개수 - 1" 보정
                     const allElems = Array.from(
                       document.querySelectorAll(
                         'a,button,input[type="button"],input[type="submit"],span'
                       )
                     ).filter((el) => isVisible(el) && isLessonBtn(el));
-                    if (!allElems.length) return 0;
-                    const rawCount = allElems.length;
+                    const rawCount = toInt(allElems.length);
+                    result.globalButtonCountRaw = rawCount;
                     // 강의실 전체 버튼에는 차시 외 진입용 버튼이 1개 포함되어 있어 -1 보정.
-                    if (rawCount <= 1) return rawCount;
-                    return rawCount - 1;
+                    result.globalButtonCountAdjusted = rawCount <= 1 ? rawCount : rawCount - 1;
+                    return result;
                 }
                 """
             )
         except Exception:  # noqa: BLE001
             return None
 
-        if isinstance(total, int) and total > 0:
-            return total
+        if not isinstance(stats, dict):
+            return None
+
+        explicit_text_total = stats.get("explicitTotalFromText")
+        if isinstance(explicit_text_total, int) and explicit_text_total > 0:
+            return explicit_text_total
+
+        explicit_script_total = stats.get("explicitTotalFromScripts")
+        if isinstance(explicit_script_total, int) and explicit_script_total > 0:
+            return explicit_script_total
+
+        scoped_lesson_section_lesson_no_count = stats.get("scopedLessonSectionLessonNoCount")
+        if isinstance(scoped_lesson_section_lesson_no_count, int) and scoped_lesson_section_lesson_no_count > 0:
+            return scoped_lesson_section_lesson_no_count
+
+        scoped_lesson_section_numbered_card_count = stats.get("scopedLessonSectionNumberedCardCount")
+        if (
+            isinstance(scoped_lesson_section_numbered_card_count, int)
+            and scoped_lesson_section_numbered_card_count > 0
+        ):
+            return scoped_lesson_section_numbered_card_count
+
+        scoped_lesson_section_button_row_count = stats.get("scopedLessonSectionButtonRowCount")
+        if isinstance(scoped_lesson_section_button_row_count, int) and scoped_lesson_section_button_row_count >= 2:
+            return scoped_lesson_section_button_row_count
+
+        scoped_lesson_section_button_count_min_positive = stats.get("scopedLessonSectionButtonCountMinPositive")
+        if (
+            isinstance(scoped_lesson_section_button_count_min_positive, int)
+            and scoped_lesson_section_button_count_min_positive >= 2
+        ):
+            return scoped_lesson_section_button_count_min_positive
+
+        scoped_lesson_no_count = stats.get("scopedLessonNoCount")
+        if isinstance(scoped_lesson_no_count, int) and scoped_lesson_no_count > 0:
+            return scoped_lesson_no_count
+
+        # 버튼 개수는 1이 자주 과소감지되는 패턴이어서 2 이상일 때만 신뢰합니다.
+        scoped_button_row_count = stats.get("scopedButtonRowCount")
+        if isinstance(scoped_button_row_count, int) and scoped_button_row_count >= 2:
+            return scoped_button_row_count
+
+        global_button_count_raw = stats.get("globalButtonCountRaw")
+        global_button_count_adjusted = stats.get("globalButtonCountAdjusted")
+        # 전체 화면에서 raw 버튼이 2개 이상이면(메인 + 차시들), 보정값을 신뢰합니다.
+        if (
+            isinstance(global_button_count_raw, int)
+            and isinstance(global_button_count_adjusted, int)
+            and global_button_count_raw >= 2
+            and global_button_count_adjusted >= 1
+        ):
+            return global_button_count_adjusted
+
         return None
+
+    def _prime_lesson_list_dom(self, page: Page) -> None:
+        # 강의실이 긴 페이지인 경우 하단 "학습 차시" DOM이 늦게 채워질 수 있어 선탐색합니다.
+        try:
+            page.locator('text=학습 차시').first.scroll_into_view_if_needed(timeout=2000)
+            page.wait_for_timeout(700)
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(900)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _open_learning_status(self, page: Page) -> LoginResult:
         if "/login/process.do" in page.url:
@@ -581,7 +1155,7 @@ class EKHNPAutomator:
         result, _ = self._enter_first_course_internal(page)
         return result
 
-    def _enter_first_course_internal(self, page: Page) -> tuple[LoginResult, Optional[Page]]:
+    def _open_first_course_classroom_internal(self, page: Page) -> tuple[LoginResult, Optional[Page]]:
         self._log("수강과정 목록 로딩 대기")
         try:
             page.wait_for_selector("table tbody tr", timeout=min(self.settings.timeout_ms, 15000))
@@ -628,12 +1202,26 @@ class EKHNPAutomator:
                     return LoginResult(False, f"'학습하기' 클릭 실패: {exc}", now_url), None
             target_page = page
 
+        return (
+            LoginResult(
+                True,
+                f"강의실 진입 성공: {first_title or '첫 번째 과정'}",
+                target_page.url,
+            ),
+            target_page,
+        )
+
+    def _enter_first_course_internal(self, page: Page) -> tuple[LoginResult, Optional[Page]]:
+        classroom_result, target_page = self._open_first_course_classroom_internal(page)
+        if not classroom_result.success or target_page is None:
+            return classroom_result, None
+
         learning_page = self._start_learning_from_progress_panel(target_page)
         if learning_page is not None:
             return (
                 LoginResult(
                     True,
-                    f"학습 시작 클릭 성공(학습진행현황): {first_title or '첫 번째 과정'}",
+                    f"학습 시작 클릭 성공(학습진행현황): {classroom_result.message.replace('강의실 진입 성공: ', '')}",
                     learning_page.url,
                 ),
                 learning_page,
@@ -651,7 +1239,12 @@ class EKHNPAutomator:
         self._log("강의실 하단 '학습진행현황'의 학습하기 버튼 클릭 시도")
         page.wait_for_timeout(1200)
         before_pages = list(page.context.pages)
+        self._prime_lesson_list_dom(page)
         self._detected_total_lessons = self._extract_total_lessons_from_classroom_buttons(page)
+        if self._detected_total_lessons is None:
+            # 지연 렌더링/가상 스크롤 대응: 한번 더 강제 로드 후 재탐색
+            self._prime_lesson_list_dom(page)
+            self._detected_total_lessons = self._extract_total_lessons_from_classroom_buttons(page)
         if self._detected_total_lessons:
             self._log(
                 f"강의실 학습하기 버튼 개수 감지: 총 {self._detected_total_lessons}차시"
@@ -755,6 +1348,700 @@ class EKHNPAutomator:
         self._dump_player_debug(page, "start_button_not_found")
         return None
 
+    def _open_comprehensive_exam_popup(self, page: Page) -> Optional[Page]:
+        self._exam_gate_blocked = False
+        self._log("강의실 '종합평가 응시하기' 버튼 클릭 시도")
+        page.wait_for_timeout(1000)
+        before_pages = list(page.context.pages)
+
+        try:
+            page.locator("text=종합평가").first.scroll_into_view_if_needed(timeout=2500)
+            page.wait_for_timeout(700)
+        except Exception:  # noqa: BLE001
+            pass
+
+        selectors = [
+            'div:has-text("종합평가") a:has-text("응시하기")',
+            'div:has-text("종합평가") button:has-text("응시하기")',
+            'div:has-text("종합평가") span:has-text("응시하기")',
+            'div:has-text("종합평가") a:has-text("click")',
+            'div:has-text("종합평가") button:has-text("click")',
+            'div:has-text("종합평가") span:has-text("click")',
+            'div:has-text("종합평가") input[value*="응시"]',
+            'div:has-text("시험평가") a:has-text("응시하기")',
+            'div:has-text("시험평가") button:has-text("응시하기")',
+            'a:has-text("종합평가")',
+            'a:has-text("응시하기")',
+            'button:has-text("응시하기")',
+            'input[value*="응시하기"]',
+        ]
+        clicked = False
+        popup_page: Optional[Page] = None
+        try:
+            with page.expect_popup(timeout=12000) as popup_info:
+                clicked = self._click_first_visible(page, selectors, max_items=40)
+            popup_page = popup_info.value if clicked else None
+        except Exception:  # noqa: BLE001
+            clicked = self._click_first_visible(page, selectors, max_items=40)
+
+        if not clicked:
+            clicked = page.evaluate(
+                """
+                () => {
+                  const normalize = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
+                  const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                  };
+                  const titleNodes = Array.from(document.querySelectorAll('div,span,strong,h1,h2,h3,h4,li,p'));
+                  const isExamTitle = (txt) => txt.includes('종합평가') || txt.includes('시험평가');
+                  const isExamButton = (txt) =>
+                    txt.includes('응시하기')
+                    || txt.includes('응시하기click')
+                    || (txt.includes('응시') && txt.includes('click'))
+                    || txt.includes('재응시')
+                    || txt.includes('평가응시');
+
+                  for (const title of titleNodes) {
+                    const tt = normalize(title.textContent);
+                    if (!isExamTitle(tt)) continue;
+                    let container = title;
+                    for (let depth = 0; depth < 8 && container; depth++) {
+                      const cands = Array.from(
+                        container.querySelectorAll('a,button,input[type="button"],input[type="submit"],span')
+                      );
+                      const target = cands.find((el) => isVisible(el) && isExamButton(normalize(el.textContent || el.value)));
+                      if (target) {
+                        target.click();
+                        return true;
+                      }
+                      container = container.parentElement;
+                    }
+                  }
+
+                  const all = Array.from(document.querySelectorAll('a,button,input[type="button"],input[type="submit"],span'));
+                  const fallback = all.find((el) => {
+                    const txt = normalize(el.textContent || el.value);
+                    return isVisible(el) && isExamButton(txt);
+                  });
+                  if (fallback) {
+                    fallback.click();
+                    return true;
+                  }
+                  return false;
+                }
+                """
+            )
+
+        if clicked:
+            page.wait_for_timeout(1500)
+            if popup_page is not None:
+                popup_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                self._log(f"종합평가 팝업 감지: {popup_page.url}")
+                return popup_page
+
+            picked = self._pick_exam_page(page.context.pages, before_pages)
+            if picked is not None and picked != page:
+                self._log(f"종합평가 창 선택: pages={len(page.context.pages)} / url={picked.url}")
+                return picked
+
+        if self._dismiss_exam_progress_gate_notice(page):
+            self._exam_gate_blocked = True
+            self._log("종합평가 응시 제한 알림 감지: 미완료 차시를 먼저 진행합니다.")
+            return None
+
+        self._log("종합평가 응시 팝업을 찾지 못했습니다.")
+        return None
+
+    def _dismiss_exam_progress_gate_notice(self, page: Page) -> bool:
+        try:
+            detected = page.evaluate(
+                """
+                () => {
+                  const normalize = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
+                  const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                  };
+                  const hasGateText = (txt) =>
+                    txt.includes('학습 진도율') && txt.includes('80') && txt.includes('응시') && txt.includes('가능');
+
+                  const textNodes = Array.from(document.querySelectorAll('div,p,span,li,strong,h1,h2,h3,h4'));
+                  let noticeNode = null;
+                  for (const node of textNodes) {
+                    const txt = normalize(node.textContent);
+                    if (hasGateText(txt)) {
+                      noticeNode = node;
+                      break;
+                    }
+                  }
+                  if (!noticeNode) return false;
+
+                  let modal = noticeNode;
+                  for (let i = 0; i < 8 && modal; i++) {
+                    const modalText = normalize(modal.innerText || modal.textContent || '');
+                    if (hasGateText(modalText)) break;
+                    modal = modal.parentElement;
+                  }
+                  if (!modal) modal = noticeNode;
+
+                  const buttons = Array.from(
+                    modal.querySelectorAll('button,a,input[type="button"],input[type="submit"],span')
+                  );
+                  const okBtn = buttons.find((el) => {
+                    const txt = normalize(el.textContent || el.value || '');
+                    return isVisible(el) && (txt === '확인' || txt.includes('확인'));
+                  });
+                  if (okBtn) {
+                    okBtn.click();
+                    return true;
+                  }
+
+                  const globalButtons = Array.from(document.querySelectorAll('button,a,input[type="button"],input[type="submit"],span'));
+                  const globalOk = globalButtons.find((el) => {
+                    const txt = normalize(el.textContent || el.value || '');
+                    return isVisible(el) && (txt === '확인' || txt.includes('확인'));
+                  });
+                  if (globalOk) {
+                    globalOk.click();
+                    return true;
+                  }
+                  return true;
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+        if detected:
+            page.wait_for_timeout(600)
+            return True
+        return False
+
+    def _probe_exam_question_stream(self, page: Page, max_questions: int = 12) -> dict[str, int]:
+        visited_keys: set[str] = set()
+        dom_readable_count = 0
+        visited_count = 0
+        total_hint = 0
+
+        self._log(f"종합평가 문항 탐침 시작 (최대 {max_questions}문항)")
+        for _ in range(max_questions):
+            snap = self._extract_exam_question_snapshot(page)
+            if snap is None:
+                self._log("문항 텍스트 판독 실패: OCR 폴백 필요 가능성")
+                break
+
+            visited_count += 1
+            key = str(snap.get("key", ""))
+            text_len = int(snap.get("text_len", 0))
+            option_count = int(snap.get("option_count", 0))
+            current = int(snap.get("current", 0))
+            total = int(snap.get("total", 0))
+            if total > 0:
+                total_hint = max(total_hint, total)
+            if text_len >= 40 and option_count >= 2:
+                dom_readable_count += 1
+
+            self._log(
+                f"문항 판독: idx={visited_count} current/total={current}/{total} text_len={text_len} option_count={option_count}"
+            )
+
+            if key in visited_keys:
+                self._log("이전 문항과 동일 화면으로 판단되어 탐침을 종료합니다.")
+                break
+            visited_keys.add(key)
+
+            if total > 0 and current >= total:
+                self._log("마지막 문항으로 보여 탐침을 종료합니다.")
+                break
+
+            if not self._click_exam_next(page):
+                self._log("다음 문항 버튼을 찾지 못해 탐침을 종료합니다.")
+                break
+
+            if not self._wait_exam_question_change(page, key):
+                self._log("다음 클릭 후 문항 변화가 감지되지 않아 탐침을 종료합니다.")
+                break
+
+        return {
+            "visited_count": visited_count,
+            "dom_readable_count": dom_readable_count,
+            "total_hint": total_hint,
+        }
+
+    def _extract_exam_question_snapshot(self, page: Page) -> Optional[dict[str, int | str]]:
+        scopes: list[Any] = [page] + list(page.frames)
+        for scope in scopes:
+            try:
+                body_text = scope.locator("body").inner_text(timeout=2000)
+            except Exception:  # noqa: BLE001
+                continue
+
+            normalized = re.sub(r"\s+", " ", body_text).strip()
+            if len(normalized) < 20:
+                continue
+
+            options_by_lines = re.findall(
+                r"(?m)^\s*(?:[1-5]|[A-Ea-e]|[가-마])\s*[\.\)]\s*.+$",
+                body_text,
+            )
+            options_by_symbols = re.findall(r"[①②③④⑤]", body_text)
+            option_count = max(len(options_by_lines), len(set(options_by_symbols)))
+
+            cur = 0
+            tot = 0
+            ratio_match = re.search(r"(\d{1,3})\s*/\s*(\d{1,3})", body_text)
+            if ratio_match:
+                try:
+                    cur = int(ratio_match.group(1))
+                    tot = int(ratio_match.group(2))
+                except ValueError:
+                    cur = 0
+                    tot = 0
+            if cur == 0:
+                cur_match = re.search(r"(?:문항|문제)\s*(\d{1,3})", body_text)
+                if cur_match:
+                    try:
+                        cur = int(cur_match.group(1))
+                    except ValueError:
+                        cur = 0
+
+            key_source = re.sub(r"[^0-9A-Za-z가-힣]+", "", normalized)[:240]
+            if not key_source:
+                continue
+
+            return {
+                "key": key_source,
+                "text_len": len(normalized),
+                "option_count": option_count,
+                "current": cur,
+                "total": tot,
+            }
+        return None
+
+    def _click_exam_next(self, page: Page) -> bool:
+        selectors = [
+            'button:has-text("다음")',
+            'a:has-text("다음")',
+            'input[value*="다음"]',
+            'button:has-text("Next")',
+            'a:has-text("Next")',
+            'a[onclick*="next"]',
+            'button[onclick*="next"]',
+        ]
+        scopes: list[Any] = [page] + list(page.frames)
+        for scope in scopes:
+            if self._click_first_visible(scope, selectors, max_items=20):
+                page.wait_for_timeout(900)
+                return True
+
+        try:
+            clicked = page.evaluate(
+                """
+                () => {
+                  const normalize = (txt) => (txt || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                  };
+                  const cands = Array.from(document.querySelectorAll('a,button,input[type="button"],input[type="submit"],span'));
+                  const target = cands.find((el) => {
+                    const txt = normalize(el.textContent || el.value);
+                    return isVisible(el) && (txt.includes('다음') || txt.includes('next') || txt.includes('다음문항'));
+                  });
+                  if (!target) return false;
+                  target.click();
+                  return true;
+                }
+                """
+            )
+            if clicked:
+                page.wait_for_timeout(900)
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _wait_exam_question_change(self, page: Page, prev_key: str, timeout_ms: int = 12000) -> bool:
+        ticks = max(1, timeout_ms // 500)
+        for _ in range(ticks):
+            page.wait_for_timeout(500)
+            snap = self._extract_exam_question_snapshot(page)
+            if snap is None:
+                continue
+            now_key = str(snap.get("key", ""))
+            if now_key and now_key != prev_key:
+                return True
+        return False
+
+    def _has_course_end_notice(self, page: Page) -> bool:
+        end_keywords = [
+            "학습이 종료되었습니다",
+            "학습이 종료",
+            "학습 종료",
+            "학습이 완료되었습니다",
+            "학습 완료",
+            "수강이 종료되었습니다",
+        ]
+        scopes: list[Any] = [page] + list(page.frames)
+        for scope in scopes:
+            try:
+                text = scope.locator("body").inner_text(timeout=1200)
+            except Exception:  # noqa: BLE001
+                continue
+            if any(k in text for k in end_keywords):
+                return True
+        return False
+
+    def _wait_exam_finished(self, exam_page: Page, timeout_ms: int = 60 * 60 * 1000) -> bool:
+        ticks = max(1, timeout_ms // 5000)
+        done_keywords = [
+            "제출완료",
+            "응시완료",
+            "시험평가 완료",
+            "평가완료",
+            "채점결과",
+            "득점",
+            "점수",
+            "재응시",
+        ]
+        for _ in range(ticks):
+            if exam_page.is_closed():
+                return True
+            scopes: list[Any] = [exam_page] + list(exam_page.frames)
+            for scope in scopes:
+                try:
+                    body = scope.locator("body").inner_text(timeout=1200)
+                except Exception:  # noqa: BLE001
+                    continue
+                if any(k in body for k in done_keywords):
+                    return True
+            exam_page.wait_for_timeout(5000)
+        return False
+
+    def _open_first_lesson_popup_for_timefill(self, page: Page) -> Optional[Page]:
+        self._log("학습시간 보충용 1차시 학습창 열기 시도")
+        before_pages = list(page.context.pages)
+        try:
+            page.locator('text=학습 차시').first.scroll_into_view_if_needed(timeout=2500)
+            page.wait_for_timeout(700)
+        except Exception:  # noqa: BLE001
+            pass
+
+        selectors = [
+            'div:has-text("학습 차시") a:has-text("학습하기")',
+            'div:has-text("학습 차시") a:has-text("이어 학습하기")',
+            'div:has-text("학습차시") a:has-text("학습하기")',
+            'div:has-text("학습차시") a:has-text("이어 학습하기")',
+            'a:has-text("학습하기")',
+            'a:has-text("이어 학습하기")',
+        ]
+        clicked = False
+        popup_page: Optional[Page] = None
+        try:
+            with page.expect_popup(timeout=12000) as popup_info:
+                clicked = self._click_first_visible(page, selectors, max_items=40)
+            popup_page = popup_info.value if clicked else None
+        except Exception:  # noqa: BLE001
+            clicked = self._click_first_visible(page, selectors, max_items=40)
+
+        if clicked:
+            page.wait_for_timeout(1500)
+            if popup_page is not None:
+                popup_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                self._log(f"학습시간 보충용 학습창 팝업 감지: {popup_page.url}")
+                return popup_page
+            picked = self._pick_learning_page(page.context.pages, before_pages)
+            if picked is not None and picked != page:
+                self._log(f"학습시간 보충용 학습창 선택: pages={len(page.context.pages)} / url={picked.url}")
+                return picked
+        return None
+
+    def _refresh_classroom_page(self, classroom_page: Page) -> None:
+        # 중요: 강의(팝업/플레이어) 창이 아니라 강의실 메인 페이지만 새로고침합니다.
+        self._log("강의실 새로고침으로 학습진행현황을 업데이트합니다.")
+        try:
+            classroom_page.reload(wait_until="domcontentloaded")
+        except Exception:  # noqa: BLE001
+            try:
+                classroom_page.goto(classroom_page.url, wait_until="domcontentloaded")
+            except Exception:  # noqa: BLE001
+                pass
+        classroom_page.wait_for_timeout(1200)
+
+    def _extract_learning_progress_status(self, classroom_page: Page) -> dict[str, int | bool]:
+        table_rows = self._extract_completion_table_rows(classroom_page)
+        progress_row = table_rows.get("학습진도율", {})
+
+        current_percent = 0
+        required_percent = 0
+        if progress_row:
+            current_percent = self._parse_percent_value(str(progress_row.get("actual", "")))
+            required_percent = self._parse_percent_value(str(progress_row.get("required", "")))
+
+        try:
+            body = classroom_page.locator("body").inner_text(timeout=5000)
+        except Exception:  # noqa: BLE001
+            body = ""
+
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+        if current_percent == 0 or required_percent == 0:
+            for line in lines:
+                if "학습진도율" in line or "진도율" in line:
+                    pcts = [int(x) for x in re.findall(r"(\d{1,3})\s*%", line)]
+                    if pcts and current_percent == 0:
+                        current_percent = max(current_percent, pcts[0])
+                    if len(pcts) >= 2 and required_percent == 0:
+                        required_percent = max(required_percent, pcts[1])
+                    if required_percent == 0 and "수료기준" in line:
+                        req_in_line = re.search(r"수료기준[^0-9]{0,12}(\d{1,3})\s*%", line)
+                        if req_in_line:
+                            required_percent = max(required_percent, int(req_in_line.group(1)))
+
+        if required_percent == 0:
+            for line in lines:
+                if "수료기준" in line and "%" in line:
+                    req = re.search(r"(\d{1,3})\s*%", line)
+                    if req:
+                        required_percent = max(required_percent, int(req.group(1)))
+
+        if required_percent == 0 and current_percent > 0:
+            required_percent = 100
+
+        incomplete_count = len(re.findall(r"미완료", body))
+        progress_ok = (
+            current_percent >= required_percent
+            if required_percent > 0
+            else current_percent >= 100
+        )
+        self._log(
+            "학습진도율 상태: "
+            f"current={current_percent}% required={required_percent}% "
+            f"incomplete={incomplete_count}"
+        )
+        return {
+            "current_percent": current_percent,
+            "required_percent": required_percent,
+            "incomplete_count": incomplete_count,
+            "progress_ok": progress_ok,
+        }
+
+    def _open_incomplete_lesson_popup(self, page: Page) -> Optional[Page]:
+        before_pages = list(page.context.pages)
+        try:
+            page.locator('text=학습 차시').first.scroll_into_view_if_needed(timeout=2500)
+            page.wait_for_timeout(700)
+        except Exception:  # noqa: BLE001
+            pass
+
+        selectors = [
+            'div:has-text("미완료") a:has-text("학습하기")',
+            'div:has-text("미완료") a:has-text("이어 학습하기")',
+            'div:has-text("미완료") button:has-text("학습하기")',
+            'div:has-text("미완료") button:has-text("이어 학습하기")',
+            'tr:has-text("미완료") a:has-text("학습하기")',
+            'tr:has-text("미완료") a:has-text("이어 학습하기")',
+        ]
+        clicked = False
+        popup_page: Optional[Page] = None
+        try:
+            with page.expect_popup(timeout=12000) as popup_info:
+                clicked = self._click_first_visible(page, selectors, max_items=60)
+            popup_page = popup_info.value if clicked else None
+        except Exception:  # noqa: BLE001
+            clicked = self._click_first_visible(page, selectors, max_items=60)
+
+        if not clicked:
+            clicked = page.evaluate(
+                """
+                () => {
+                  const normalize = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
+                  const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                  };
+                  const isLessonBtn = (txt) => (
+                    txt === '학습하기' || txt === '이어 학습하기' || txt === '이어학습하기'
+                  );
+
+                  const containers = Array.from(document.querySelectorAll('tr,li,div,section,article'));
+                  for (const c of containers) {
+                    const ctxt = normalize(c.innerText || c.textContent || '');
+                    if (!ctxt.includes('미완료')) continue;
+                    const cands = Array.from(
+                      c.querySelectorAll('a,button,input[type="button"],input[type="submit"],span')
+                    );
+                    const target = cands.find((el) => isVisible(el) && isLessonBtn(normalize(el.textContent || el.value)));
+                    if (target) {
+                      target.click();
+                      return true;
+                    }
+                  }
+                  return false;
+                }
+                """
+            )
+
+        if clicked:
+            page.wait_for_timeout(1500)
+            if popup_page is not None:
+                popup_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                return popup_page
+            picked = self._pick_learning_page(page.context.pages, before_pages)
+            if picked is not None and picked != page:
+                return picked
+        return None
+
+    def _extract_study_time_status(self, classroom_page: Page) -> dict[str, int | bool]:
+        table_rows = self._extract_completion_table_rows(classroom_page)
+        time_row = table_rows.get("학습시간", {})
+
+        current_seconds = 0
+        required_seconds = 0
+        if time_row:
+            current_seconds = self._parse_duration_to_seconds(str(time_row.get("actual", "")))
+            required_seconds = self._parse_duration_to_seconds(str(time_row.get("required", "")))
+
+        try:
+            body = classroom_page.locator("body").inner_text(timeout=5000)
+        except Exception:  # noqa: BLE001
+            body = ""
+
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+
+        if current_seconds == 0 or required_seconds == 0:
+            for line in lines:
+                if "학습시간" in line and "수료기준" in line:
+                    left, right = line.split("수료기준", 1)
+                    if current_seconds == 0:
+                        current_seconds = max(current_seconds, self._parse_duration_to_seconds(left))
+                    if required_seconds == 0:
+                        required_seconds = max(required_seconds, self._parse_duration_to_seconds(right))
+
+        if current_seconds == 0:
+            for line in lines:
+                if "나의 학습시간" in line or "학습시간" in line:
+                    current_seconds = max(current_seconds, self._parse_duration_to_seconds(line))
+        if required_seconds == 0:
+            for line in lines:
+                if "수료기준" in line and ("시간" in line or "분" in line or "초" in line or ":" in line):
+                    required_seconds = max(required_seconds, self._parse_duration_to_seconds(line))
+
+        shortage_seconds = max(required_seconds - current_seconds, 0) if required_seconds > 0 else 0
+        requirement_known = required_seconds > 0
+
+        self._log(
+            "학습시간 상태: "
+            f"current={self._format_seconds(current_seconds)}, "
+            f"required={self._format_seconds(required_seconds)}, "
+            f"shortage={self._format_seconds(shortage_seconds)}"
+        )
+        return {
+            "current_seconds": current_seconds,
+            "required_seconds": required_seconds,
+            "shortage_seconds": shortage_seconds,
+            "requirement_known": requirement_known,
+        }
+
+    def _extract_completion_table_rows(self, classroom_page: Page) -> dict[str, dict[str, str]]:
+        try:
+            raw = classroom_page.evaluate(
+                """
+                () => {
+                  const normalize = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
+                  const tables = Array.from(document.querySelectorAll('table'));
+                  for (const table of tables) {
+                    const headerCells = Array.from(table.querySelectorAll('tr:first-child th, tr:first-child td'))
+                      .map((el) => normalize(el.textContent));
+                    const hasHeaders =
+                      headerCells.some((h) => h.includes('항목'))
+                      && headerCells.some((h) => h.includes('수료기준'))
+                      && headerCells.some((h) => h.includes('나의실적'));
+                    if (!hasHeaders) continue;
+
+                    const rows = {};
+                    const trs = Array.from(table.querySelectorAll('tr')).slice(1);
+                    for (const tr of trs) {
+                      const cells = Array.from(tr.querySelectorAll('th,td')).map((el) => normalize(el.textContent));
+                      if (cells.length < 3) continue;
+                      const item = cells[0];
+                      rows[item] = {
+                        required: cells[1] || '',
+                        actual: cells[2] || '',
+                        result: cells[3] || '',
+                      };
+                    }
+                    return rows;
+                  }
+                  return {};
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            return {}
+
+        if not isinstance(raw, dict):
+            return {}
+
+        result: dict[str, dict[str, str]] = {}
+        for k, v in raw.items():
+            if not isinstance(k, str) or not isinstance(v, dict):
+                continue
+            result[k] = {
+                "required": str(v.get("required", "")),
+                "actual": str(v.get("actual", "")),
+                "result": str(v.get("result", "")),
+            }
+        return result
+
+    @staticmethod
+    def _parse_duration_to_seconds(text: str) -> int:
+        src = text.replace(",", " ").strip()
+        h = 0
+        m = 0
+        s = 0
+
+        h_match = re.search(r"(\d{1,3})\s*시간", src)
+        if h_match:
+            h = int(h_match.group(1))
+        m_match = re.search(r"(\d{1,3})\s*분", src)
+        if m_match:
+            m = int(m_match.group(1))
+        s_match = re.search(r"(\d{1,3})\s*초", src)
+        if s_match:
+            s = int(s_match.group(1))
+
+        if h == 0 and m == 0 and s == 0:
+            hms = re.search(r"(\d{1,3})\s*:\s*(\d{1,2})(?:\s*:\s*(\d{1,2}))?", src)
+            if hms:
+                if hms.group(3) is None:
+                    m = int(hms.group(1))
+                    s = int(hms.group(2))
+                else:
+                    h = int(hms.group(1))
+                    m = int(hms.group(2))
+                    s = int(hms.group(3))
+
+        return h * 3600 + m * 60 + s
+
+    @staticmethod
+    def _parse_percent_value(text: str) -> int:
+        m = re.search(r"(\d{1,3})(?:\.\d+)?\s*%", text)
+        if not m:
+            return 0
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _format_seconds(value: int) -> str:
+        total = max(0, int(value))
+        h = total // 3600
+        m = (total % 3600) // 60
+        s = total % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
     def _complete_lesson_steps(self, page: Page) -> LoginResult:
         self._log("차시 단계 자동 진행 시작")
         candidate_page = page
@@ -771,6 +2058,13 @@ class EKHNPAutomator:
                     progress = self._wait_for_step_progress(candidate_page, wait_ms=12000)
 
             if progress is None:
+                if self._has_course_end_notice(candidate_page):
+                    return LoginResult(
+                        True,
+                        "학습 종료 안내 문구 감지: 차시 완료 처리",
+                        candidate_page.url,
+                        next_lesson_clicked=False,
+                    )
                 self._dump_player_debug(candidate_page, "progress_not_found")
                 return LoginResult(False, "현재/전체 단계 표시를 찾지 못했습니다.", candidate_page.url)
 
@@ -815,6 +2109,13 @@ class EKHNPAutomator:
 
             clicked = self._click_next_button(candidate_page)
             if not clicked:
+                if self._has_course_end_notice(candidate_page):
+                    return LoginResult(
+                        True,
+                        "학습 종료 안내 문구 감지: 차시 완료 처리",
+                        candidate_page.url,
+                        next_lesson_clicked=False,
+                    )
                 return LoginResult(
                     False,
                     f"'다음' 버튼 클릭 실패: {current_step}/{total_step}에서 중단",
@@ -834,6 +2135,13 @@ class EKHNPAutomator:
                             candidate_page = picked
                             check = self._wait_for_step_progress(candidate_page, wait_ms=12000)
                     if check is None:
+                        if self._has_course_end_notice(candidate_page):
+                            return LoginResult(
+                                True,
+                                "학습 종료 안내 문구 감지: 차시 완료 처리",
+                                candidate_page.url,
+                                next_lesson_clicked=False,
+                            )
                         return LoginResult(False, "다음 클릭 후 단계 정보를 읽지 못했습니다.", candidate_page.url)
                 if check[0] == current_step and check[1] == total_step:
                     self._log("단계 증가가 없어 추가 대기/복구 후 재시도를 진행합니다.")
@@ -853,6 +2161,13 @@ class EKHNPAutomator:
                             advanced = True
                             break
                     if not advanced:
+                        if self._has_course_end_notice(candidate_page):
+                            return LoginResult(
+                                True,
+                                "학습 종료 안내 문구 감지: 차시 완료 처리",
+                                candidate_page.url,
+                                next_lesson_clicked=False,
+                            )
                         self._dump_player_debug(candidate_page, "recovery_failed")
                         return LoginResult(
                             False,
@@ -1175,6 +2490,23 @@ class EKHNPAutomator:
                 return pg
         if new_pages:
             return new_pages[-1]
+        return None
+
+    @staticmethod
+    def _pick_exam_page(current_pages: list[Page], old_pages: list[Page]) -> Optional[Page]:
+        old_set = set(old_pages)
+        new_pages = [pg for pg in current_pages if pg not in old_set]
+        exam_hints = ["exam", "test", "quiz", "evaluation", "eval", "popup.do", "/learning/"]
+        for pg in reversed(new_pages):
+            url = pg.url.lower()
+            if any(h in url for h in exam_hints):
+                return pg
+        for pg in reversed(new_pages):
+            return pg
+        for pg in reversed(current_pages):
+            url = pg.url.lower()
+            if any(h in url for h in exam_hints):
+                return pg
         return None
 
     def _find_page_with_progress(self, pages: list[Page]) -> Optional[Page]:
