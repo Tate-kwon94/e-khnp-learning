@@ -1,0 +1,90 @@
+# e-khnp automation project
+
+Playwright + Streamlit 기반 e-khnp 수강 자동화 도구입니다.
+
+## 1) macOS(집 맥미니) 실행
+
+```bash
+cd "/Users/maegbug-eeo/Documents/New project/e-khnp automation project"
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+playwright install chromium
+cp .env.example .env
+```
+
+`.env`에 계정 정보를 넣습니다.
+
+```dotenv
+EKHNP_USER_ID=사번
+EKHNP_USER_PASSWORD=비밀번호
+EKHNP_HEADLESS=false
+EKHNP_TIMEOUT_MS=90000
+```
+
+실행:
+
+```bash
+source .venv/bin/activate
+streamlit run app.py
+```
+
+## 2) Windows 실행(회사 PC)
+
+```powershell
+cd "C:\work\e-khnp"
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+playwright install chromium
+copy .env.example .env
+```
+
+실행:
+
+```powershell
+.venv\Scripts\activate
+streamlit run app.py
+```
+
+## 3) GitHub로 집/회사 동기화
+
+최초 1회(현재 프로젝트 폴더에서):
+
+```bash
+cd "/Users/maegbug-eeo/Documents/New project/e-khnp automation project"
+git init
+git add .
+git commit -m "init: e-khnp automation"
+git branch -M main
+git remote add origin https://github.com/Tate-kwon/e-khnp.git
+git push -u origin main
+```
+
+작업 루틴:
+
+```bash
+git pull --rebase
+# 작업
+git add .
+git commit -m "feat: update automation logic"
+git push
+```
+
+## 4) 현재 자동화 핵심 동작
+
+- 로그인
+- `My학습포털 > 나의 학습현황` 이동
+- 수강과정 첫 과목 진입
+- 학습진행현황의 `학습하기/이어 학습하기` 클릭
+- 차시 단계 파란색 완료 확인 후 다음 단계 이동
+- 우하단 `다음(Next)` 클릭 시 다음 차시 반복
+- 자동 종료 모드 지원:
+  - 총 차시 감지 우선(강의실 학습하기 버튼 기준)
+  - Next 버튼 기준
+  - 사용자 입력 차시 수 기준
+
+## 5) 보안 주의
+
+- `.env`는 커밋하지 않습니다.
+- 계정 정보는 로그에 저장하지 않습니다.
