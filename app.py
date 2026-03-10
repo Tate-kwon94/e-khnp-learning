@@ -119,11 +119,45 @@ def main() -> None:
             format="%.2f",
         )
     )
+    rag_web_search_enabled = st.checkbox(
+        "웹 검색 강제 참조",
+        value=True,
+        disabled=True,
+        help="문항 풀이 시 웹 검색 결과를 항상 참조합니다. (고정)",
+    )
+    rag_web_top_n = int(
+        st.number_input("웹 검색 상위 결과 수", min_value=1, max_value=8, value=settings.rag_web_top_n, step=1)
+    )
+    rag_web_timeout_sec = int(
+        st.number_input("웹 검색 타임아웃(초)", min_value=3, max_value=20, value=settings.rag_web_timeout_sec, step=1)
+    )
+    rag_web_weight = float(
+        st.number_input(
+            "웹 점수 가중치",
+            min_value=0.0,
+            max_value=0.8,
+            value=settings.rag_web_weight,
+            step=0.05,
+            format="%.2f",
+        )
+    )
     timefill_check_interval_min = int(
         st.number_input("학습시간 부족 체크 간격(분)", min_value=1, max_value=60, value=10, step=1)
     )
     timefill_check_limit = int(
         st.number_input("학습시간 부족 체크 최대 횟수", min_value=1, max_value=72, value=24, step=1)
+    )
+    completion_max_courses = int(
+        st.number_input("수료 자동 최대 과정 수", min_value=1, max_value=40, value=settings.completion_max_courses, step=1)
+    )
+    exam_answer_bank_path = st.text_input("시험 정답 인덱스 파일", value=settings.exam_answer_bank_path)
+    exam_auto_retry_max = int(
+        st.number_input("시험 자동 재응시 최대 횟수", min_value=0, max_value=4, value=settings.exam_auto_retry_max, step=1)
+    )
+    exam_retry_requires_answer_index = st.checkbox(
+        "정답 인덱스 없으면 재응시 중단",
+        value=settings.exam_retry_requires_answer_index,
+        help="점수 미달 시 결과지에서 정답 인덱싱이 되지 않으면 자동 재응시를 중단합니다.",
     )
 
     st.subheader("설정 확인")
@@ -142,6 +176,22 @@ def main() -> None:
             "rag_generate_model": rag_generate_model,
             "rag_top_k": rag_top_k,
             "rag_conf_threshold": rag_conf_threshold,
+            "rag_chunk_size": settings.rag_chunk_size,
+            "rag_chunk_overlap": settings.rag_chunk_overlap,
+            "rag_min_chunk_chars": settings.rag_min_chunk_chars,
+            "rag_max_chunks": settings.rag_max_chunks,
+            "rag_storage_limit_gb": settings.rag_storage_limit_gb,
+            "rag_prune_old_indexes": settings.rag_prune_old_indexes,
+            "rag_pass_score": settings.rag_pass_score,
+            "rag_low_conf_floor": settings.rag_low_conf_floor,
+            "rag_web_search_enabled": rag_web_search_enabled,
+            "rag_web_top_n": rag_web_top_n,
+            "rag_web_timeout_sec": rag_web_timeout_sec,
+            "rag_web_weight": rag_web_weight,
+            "completion_max_courses": completion_max_courses,
+            "exam_answer_bank_path": exam_answer_bank_path,
+            "exam_auto_retry_max": exam_auto_retry_max,
+            "exam_retry_requires_answer_index": exam_retry_requires_answer_index,
         }
     )
 
@@ -153,7 +203,7 @@ def main() -> None:
     with col3:
         run_first_course = st.button("첫 과목 학습 시작", use_container_width=True)
     with col4:
-        run_complete_lesson = st.button("첫 과목 모든 차시 완료(반복)", use_container_width=True)
+        run_complete_lesson = st.button("강의 순차 완료(첫 행→다음)", use_container_width=True)
     with col5:
         run_exam_probe = st.button("종합평가 텍스트 탐침", use_container_width=True)
     with col6:
@@ -206,7 +256,7 @@ def main() -> None:
         append_log(f"결과: {result.message} / url={result.current_url}")
 
     if run_complete_lesson:
-        append_log("로그인 + 첫 과목 진입 + 모든 차시 반복 자동 진행을 시작합니다.")
+        append_log("로그인 + 강의 목록 첫 행부터 순차 진입 + 차시 자동 완료를 시작합니다.")
         settings.user_id = user_id_input.strip()
         settings.user_password = user_password_input
         settings.headless = not show_browser
@@ -245,6 +295,20 @@ def main() -> None:
         settings.user_id = user_id_input.strip()
         settings.user_password = user_password_input
         settings.headless = not show_browser
+        settings.completion_max_courses = completion_max_courses
+        settings.rag_docs_dir = rag_docs_dir.strip()
+        settings.rag_index_path = rag_index_path.strip()
+        settings.rag_embed_model = rag_embed_model.strip()
+        settings.rag_generate_model = rag_generate_model.strip()
+        settings.rag_top_k = rag_top_k
+        settings.rag_conf_threshold = rag_conf_threshold
+        settings.rag_web_search_enabled = rag_web_search_enabled
+        settings.rag_web_top_n = rag_web_top_n
+        settings.rag_web_timeout_sec = rag_web_timeout_sec
+        settings.rag_web_weight = rag_web_weight
+        settings.exam_answer_bank_path = exam_answer_bank_path.strip()
+        settings.exam_auto_retry_max = exam_auto_retry_max
+        settings.exam_retry_requires_answer_index = exam_retry_requires_answer_index
         automator = EKHNPAutomator(settings, log_fn=append_log)
         result = automator.login_and_run_completion_workflow(
             check_interval_minutes=timefill_check_interval_min,
@@ -268,6 +332,12 @@ def main() -> None:
                 docs_dir=settings.rag_docs_dir,
                 index_path=settings.rag_index_path,
                 embed_model=settings.rag_embed_model,
+                chunk_size=settings.rag_chunk_size,
+                overlap=settings.rag_chunk_overlap,
+                min_chunk_chars=settings.rag_min_chunk_chars,
+                max_chunks=settings.rag_max_chunks,
+                max_total_size_gb=settings.rag_storage_limit_gb,
+                prune_old_indexes=settings.rag_prune_old_indexes,
                 ollama_base_url=settings.ollama_base_url,
                 log_fn=append_log,
             )
@@ -292,6 +362,13 @@ def main() -> None:
         settings.rag_generate_model = rag_generate_model.strip()
         settings.rag_top_k = rag_top_k
         settings.rag_conf_threshold = rag_conf_threshold
+        settings.rag_web_search_enabled = rag_web_search_enabled
+        settings.rag_web_top_n = rag_web_top_n
+        settings.rag_web_timeout_sec = rag_web_timeout_sec
+        settings.rag_web_weight = rag_web_weight
+        settings.exam_answer_bank_path = exam_answer_bank_path.strip()
+        settings.exam_auto_retry_max = exam_auto_retry_max
+        settings.exam_retry_requires_answer_index = exam_retry_requires_answer_index
         automator = EKHNPAutomator(settings, log_fn=append_log)
         result = automator.login_and_solve_exam_with_rag(
             max_questions=60,

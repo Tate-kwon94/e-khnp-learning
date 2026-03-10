@@ -117,7 +117,24 @@ RAG_INDEX_PATH=rag/index.json
 RAG_EMBED_MODEL=nomic-embed-text
 RAG_GENERATE_MODEL=qwen2.5:7b-instruct
 RAG_TOP_K=6
-RAG_CONF_THRESHOLD=0.72
+RAG_CONF_THRESHOLD=0.65
+RAG_CHUNK_SIZE=900
+RAG_CHUNK_OVERLAP=150
+RAG_MIN_CHUNK_CHARS=80
+RAG_MAX_CHUNKS=50000
+RAG_STORAGE_LIMIT_GB=20
+RAG_PRUNE_OLD_INDEXES=true
+RAG_PASS_SCORE=75
+RAG_LOW_CONF_FLOOR=0.55
+RAG_WEB_SEARCH_ENABLED=true
+RAG_WEB_TOP_N=4
+RAG_WEB_TIMEOUT_SEC=8
+RAG_WEB_WEIGHT=0.35
+EXAM_ANSWER_BANK_PATH=rag/exam_answer_bank.json
+EXAM_AUTO_RETRY_MAX=2
+EXAM_RETRY_REQUIRES_ANSWER_INDEX=true
+EXAM_ATTEMPT_RESERVE=1
+COMPLETION_MAX_COURSES=20
 ```
 
 실행 순서(Streamlit UI):
@@ -130,8 +147,21 @@ RAG_CONF_THRESHOLD=0.72
 
 - 신뢰도(`RAG 신뢰도 임계치`)보다 낮으면 자동풀이를 중단하도록 설계되었습니다.
 - 신뢰도 미달 시 재질문 1회를 추가 시도합니다.
+- 기본 신뢰도 임계치는 `0.65`(75점 보수 운용 기준)이며 필요 시 조정하세요.
+- 보수 운용 기준은 `RAG_PASS_SCORE=75`로 설정되어 저신뢰 문항 허용량을 자동 제한합니다.
 - 시험 문항 DOM 추출 실패 시 OCR 폴백을 시도합니다. (`tesseract` 설치 시 활성)
 - Ollama가 실행 중이 아니면 인덱싱/풀이가 실패합니다.
+- `EXAM_ATTEMPT_RESERVE=1`이면 각 강의당 마지막 1회 응시는 자동화에서 남겨둡니다.
+- 문항 풀이 시 웹 검색은 항상 참조되도록 고정되어 있습니다.
+- 웹 검색은 DuckDuckGo HTML 결과를 사용합니다(인터넷 연결 필요).
+- `RAG_WEB_WEIGHT`는 로컬 RAG 점수와 웹 검색 점수 결합 비율입니다.
+- 점수 미달 시 결과지(`item result`)에서 정답을 추출해 `EXAM_ANSWER_BANK_PATH` 인덱스에 저장합니다.
+- 인덱스된 정답은 다음 응시에서 RAG보다 우선 적용됩니다.
+- `EXAM_AUTO_RETRY_MAX` 범위 내에서 자동 재응시를 수행합니다.
+- `EXAM_RETRY_REQUIRES_ANSWER_INDEX=true`면 정답 인덱싱 실패 시 재응시를 중단합니다.
+- `COMPLETION_MAX_COURSES`는 한 번 실행에서 자동 처리할 최대 과정 수(안전 상한)입니다.
+- `수료 순서 자동(진도→시험→시간)`은 종합평가를 RAG 자동풀이로 진행한 뒤 수료 판정을 확인합니다.
+- 인덱싱 시 중복 청크 제거 + `f16` 임베딩 저장 + 저장공간 상한(`RAG_STORAGE_LIMIT_GB`)을 적용합니다.
 
 ## 7) 야간 자동 러너
 
