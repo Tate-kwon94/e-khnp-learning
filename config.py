@@ -46,7 +46,7 @@ class Settings:
     rag_max_chunks: int = int(os.getenv("RAG_MAX_CHUNKS", "50000"))
     rag_storage_limit_gb: float = float(os.getenv("RAG_STORAGE_LIMIT_GB", "20"))
     rag_prune_old_indexes: bool = _env_bool("RAG_PRUNE_OLD_INDEXES", "true")
-    rag_pass_score: int = int(os.getenv("RAG_PASS_SCORE", "75"))
+    rag_pass_score: int = int(os.getenv("RAG_PASS_SCORE", "80"))
     rag_low_conf_floor: float = float(os.getenv("RAG_LOW_CONF_FLOOR", "0.55"))
     rag_web_search_enabled: bool = _env_bool("RAG_WEB_SEARCH_ENABLED", "true")
     rag_web_top_n: int = int(os.getenv("RAG_WEB_TOP_N", "4"))

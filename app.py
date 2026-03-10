@@ -52,16 +52,16 @@ def main() -> None:
     with milestone_cols[3]:
         st.metric(
             "M4 강의 재생·완료처리",
-            "89%",
+            "94%",
             help="차시 진행률 판독 + 파란색 완료 확인 + 우하단 Next로 다음 차시 반복 처리",
         )
     with milestone_cols[4]:
         st.metric(
             "M5 수료 순서 자동화",
-            "74%",
-            help="진도율→시험평가→학습시간 보충(강의실 새로고침 체크) 워크플로우",
+            "90%",
+            help="원클릭 실행 + 진도율→시험평가→학습시간 보충 + 1차시 직접진입/동적시간체크 + 시험없음/응시보존/정답지 인덱싱 재응시",
         )
-    st.progress(0.93, text="전체 진행률 93%")
+    st.progress(0.97, text="전체 진행률 97%")
 
     st.subheader("로그인 정보 입력")
     input_col1, input_col2 = st.columns(2)
@@ -142,7 +142,13 @@ def main() -> None:
         )
     )
     timefill_check_interval_min = int(
-        st.number_input("학습시간 부족 체크 간격(분)", min_value=1, max_value=60, value=10, step=1)
+        st.number_input(
+            "학습시간 부족 체크 기본 간격(분, 실제 5~10분 동적)",
+            min_value=1,
+            max_value=60,
+            value=10,
+            step=1,
+        )
     )
     timefill_check_limit = int(
         st.number_input("학습시간 부족 체크 최대 횟수", min_value=1, max_value=72, value=24, step=1)
@@ -158,6 +164,11 @@ def main() -> None:
         "정답 인덱스 없으면 재응시 중단",
         value=settings.exam_retry_requires_answer_index,
         help="점수 미달 시 결과지에서 정답 인덱싱이 되지 않으면 자동 재응시를 중단합니다.",
+    )
+    one_click_force_reindex = st.checkbox(
+        "원클릭 실행 시 RAG 인덱스 강제 재생성",
+        value=False,
+        help="체크 시 인덱스 파일이 있어도 다시 생성합니다.",
     )
 
     st.subheader("설정 확인")
@@ -195,6 +206,12 @@ def main() -> None:
         }
     )
 
+    run_one_click = st.button(
+        "원클릭 전체 자동 실행 (인덱스 확인 → 수료 자동)",
+        type="primary",
+        use_container_width=True,
+    )
+
     col1, col2, col3, col4, col5, col6, col7, col8, col9 = st.columns(9)
     with col1:
         run_login = st.button("로그인 테스트 실행", use_container_width=True)
@@ -215,6 +232,72 @@ def main() -> None:
     with col9:
         if st.button("로그 초기화", use_container_width=True):
             st.session_state.logs = []
+
+    if run_one_click:
+        append_log("원클릭 전체 자동 실행을 시작합니다. (필요 시 인덱스 생성 → 수료 자동)")
+        settings.user_id = user_id_input.strip()
+        settings.user_password = user_password_input
+        settings.headless = not show_browser
+        settings.completion_max_courses = completion_max_courses
+        settings.rag_docs_dir = rag_docs_dir.strip()
+        settings.rag_index_path = rag_index_path.strip()
+        settings.rag_embed_model = rag_embed_model.strip()
+        settings.rag_generate_model = rag_generate_model.strip()
+        settings.rag_top_k = rag_top_k
+        settings.rag_conf_threshold = rag_conf_threshold
+        settings.rag_web_search_enabled = rag_web_search_enabled
+        settings.rag_web_top_n = rag_web_top_n
+        settings.rag_web_timeout_sec = rag_web_timeout_sec
+        settings.rag_web_weight = rag_web_weight
+        settings.exam_answer_bank_path = exam_answer_bank_path.strip()
+        settings.exam_auto_retry_max = exam_auto_retry_max
+        settings.exam_retry_requires_answer_index = exam_retry_requires_answer_index
+
+        index_path = Path(settings.rag_index_path) if settings.rag_index_path else None
+        need_reindex = bool(one_click_force_reindex)
+        if index_path is not None and not index_path.exists():
+            need_reindex = True
+            append_log(f"RAG 인덱스 파일이 없어 자동 생성합니다: {index_path}")
+
+        one_click_blocked = False
+        if need_reindex:
+            try:
+                from rag_index import build_rag_index
+
+                index_result = build_rag_index(
+                    docs_dir=settings.rag_docs_dir,
+                    index_path=settings.rag_index_path,
+                    embed_model=settings.rag_embed_model,
+                    chunk_size=settings.rag_chunk_size,
+                    overlap=settings.rag_chunk_overlap,
+                    min_chunk_chars=settings.rag_min_chunk_chars,
+                    max_chunks=settings.rag_max_chunks,
+                    max_total_size_gb=settings.rag_storage_limit_gb,
+                    prune_old_indexes=settings.rag_prune_old_indexes,
+                    ollama_base_url=settings.ollama_base_url,
+                    log_fn=append_log,
+                )
+                append_log(
+                    "원클릭 사전 인덱싱 완료: "
+                    f"files={index_result.get('files')} chunks={index_result.get('chunks')} "
+                    f"path={index_result.get('index_path')}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                one_click_blocked = True
+                st.error(f"원클릭 중 RAG 인덱스 생성 실패: {exc}")
+                append_log(f"원클릭 중 RAG 인덱스 생성 실패: {exc}")
+
+        if not one_click_blocked:
+            automator = EKHNPAutomator(settings, log_fn=append_log)
+            result = automator.login_and_run_completion_workflow(
+                check_interval_minutes=timefill_check_interval_min,
+                max_timefill_checks=timefill_check_limit,
+            )
+            if result.success:
+                st.success(result.message)
+            else:
+                st.error(result.message)
+            append_log(f"결과: {result.message} / url={result.current_url}")
 
     if run_login:
         append_log("로그인 테스트를 시작합니다.")
