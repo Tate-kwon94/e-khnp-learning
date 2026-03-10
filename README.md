@@ -2,6 +2,13 @@
 
 Playwright + Streamlit 기반 e-khnp 수강 자동화 도구입니다.
 
+## 0) 현재 상태 (2026-03-10)
+
+- 학습진도율: `100%`
+- 미완료: `0개`
+- 종합평가: LLM 준비 대기(현재 Ollama 미구동)
+- 상태 파일: `logs/overnight_status_live.json`
+
 ## 1) macOS(집 맥미니) 실행
 
 ```bash
@@ -125,3 +132,24 @@ RAG_CONF_THRESHOLD=0.72
 - 신뢰도 미달 시 재질문 1회를 추가 시도합니다.
 - 시험 문항 DOM 추출 실패 시 OCR 폴백을 시도합니다. (`tesseract` 설치 시 활성)
 - Ollama가 실행 중이 아니면 인덱싱/풀이가 실패합니다.
+
+## 7) 야간 자동 러너
+
+장시간 자동 진행/상태기록용 러너:
+
+```bash
+source .venv/bin/activate
+EKHNP_USER_ID=사번 EKHNP_USER_PASSWORD=비밀번호 \
+python -u overnight_runner.py \
+  --target-percent 80 \
+  --max-cycles 80 \
+  --lessons-per-cycle 1 \
+  --sleep-seconds 10 \
+  --report-path logs/overnight_status_live.json
+```
+
+동작 요약:
+
+- 진도율이 목표 미만이면 차시를 계속 진행합니다.
+- 목표 도달 후에는 LLM 준비(Ollama + RAG 인덱스)를 확인합니다.
+- `require_llm_before_exam` 기본값이 켜져 있어 LLM 미준비 시 응시는 보류됩니다.

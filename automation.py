@@ -374,6 +374,97 @@ class EKHNPAutomator:
                 context.close()
                 browser.close()
 
+    def login_and_check_learning_progress(self) -> LoginResult:
+        if not self.settings.user_id or not self.settings.user_password:
+            return LoginResult(False, "환경변수에 EKHNP_USER_ID / EKHNP_USER_PASSWORD를 설정하세요.")
+
+        self._log("브라우저를 시작합니다.")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=self.settings.headless)
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_default_timeout(self.settings.timeout_ms)
+            dialog_messages: list[str] = []
+            page.on("dialog", lambda dialog: self._handle_dialog(dialog, dialog_messages))
+
+            try:
+                page.goto(self.settings.login_url, wait_until="commit")
+                self._log(f"로그인 페이지 이동: {self.settings.login_url}")
+                if not self._wait_login_form_ready(page):
+                    return LoginResult(False, "로그인 폼 로딩 타임아웃", page.url)
+
+                id_candidates = [
+                    "#j_userId",
+                    'input[name="j_userId"]',
+                    'input[placeholder*="사번 또는 아이디"]',
+                    'input[name="id"]',
+                    'input[name="userId"]',
+                    'input[type="text"]',
+                ]
+                pw_candidates = [
+                    "#j_password",
+                    'input[name="j_password"]',
+                    'input[placeholder*="비밀번호를 입력해 주세요"]',
+                    'input[name="password"]',
+                    'input[name="userPw"]',
+                    'input[type="password"]',
+                ]
+                submit_candidates = [
+                    "a.btn-login",
+                    'a[onclick*="doLogin"]',
+                    'button[type="submit"]',
+                    'input[type="submit"]',
+                    'button:has-text("로그인")',
+                    'a:has-text("로그인")',
+                ]
+
+                id_filled = self._fill_first_visible(page, id_candidates, self.settings.user_id)
+                pw_filled = self._fill_first_visible(page, pw_candidates, self.settings.user_password)
+                submitted = self._click_first_visible(page, submit_candidates)
+
+                if not id_filled or not pw_filled:
+                    return LoginResult(False, "로그인 입력창을 찾지 못했습니다.", page.url)
+                if not submitted:
+                    now_url = page.url
+                    if (
+                        "login/process.do" in now_url
+                        or "param=success" in now_url
+                        or "loginpage.do" not in now_url
+                    ):
+                        self._log("로그인 버튼 감지는 실패했지만 로그인 처리 URL 변화를 감지했습니다.")
+                    else:
+                        return LoginResult(False, "로그인 버튼을 찾지 못했습니다.", page.url)
+
+                login_result = self._wait_login_result(page, dialog_messages)
+                if not login_result.success:
+                    return login_result
+
+                status_result = self._open_learning_status(page)
+                if not status_result.success:
+                    return status_result
+
+                classroom_result, classroom_page = self._open_first_course_classroom_internal(page)
+                if not classroom_result.success or classroom_page is None:
+                    return classroom_result
+
+                self._refresh_classroom_page(classroom_page)
+                progress_status = self._extract_learning_progress_status(classroom_page)
+                cur = int(progress_status.get("current_percent", 0))
+                req = int(progress_status.get("required_percent", 0))
+                inc = int(progress_status.get("incomplete_count", 0))
+                return LoginResult(
+                    True,
+                    f"학습진도율 {cur}% / 수료기준 {req}% / 미완료 {inc}개",
+                    classroom_page.url,
+                )
+            except PlaywrightTimeoutError:
+                return LoginResult(False, "타임아웃이 발생했습니다.", page.url)
+            except Exception as exc:  # noqa: BLE001
+                return LoginResult(False, f"오류 발생: {exc}", page.url)
+            finally:
+                context.close()
+                browser.close()
+
     def login_and_solve_exam_with_rag(
         self,
         max_questions: int = 60,
