@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import base64
+import html
 import json
 import math
 import re
+import struct
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from typing import Optional
 from urllib import error, request
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 
 @dataclass
@@ -72,6 +77,10 @@ class RagExamSolver:
         generate_model: str = "qwen2.5:7b-instruct",
         embed_model: Optional[str] = None,
         ollama_base_url: str = "http://127.0.0.1:11434",
+        web_search_enabled: bool = True,
+        web_top_n: int = 4,
+        web_timeout_sec: int = 8,
+        web_weight: float = 0.35,
     ) -> None:
         src = Path(index_path)
         if not src.exists():
@@ -81,26 +90,390 @@ class RagExamSolver:
         if not isinstance(chunks, list) or not chunks:
             raise RuntimeError("RAG index has no chunks")
         meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+        sources = raw.get("sources")
+        self.sources = [str(x) for x in sources] if isinstance(sources, list) else []
         self.embed_model = embed_model or str(meta.get("embed_model") or "nomic-embed-text")
         self.generate_model = generate_model
-        self.chunks = chunks
         self.client = OllamaClient(base_url=ollama_base_url)
+        self.web_search_enabled = bool(web_search_enabled)
+        self.web_top_n = max(1, min(int(web_top_n), 8))
+        self.web_timeout_sec = max(3, min(int(web_timeout_sec), 20))
+        self.web_weight = max(0.0, min(float(web_weight), 0.8))
+        self._embed_cache: dict[str, list[float]] = {}
+        self._web_cache: dict[str, list[dict[str, str]]] = {}
+        self._chunk_views: list[dict[str, Any]] = []
+        self._idf: dict[str, float] = {}
+        self._prepare_chunk_views(chunks)
 
-    def _retrieve(self, query: str, top_k: int = 6) -> list[dict[str, object]]:
-        q_emb = self.client.embed(self.embed_model, query)
-        q_norm = math.sqrt(sum(x * x for x in q_emb)) or 1.0
-        scored: list[tuple[float, dict[str, object]]] = []
-        for ch in self.chunks:
-            emb = ch.get("embedding")
-            if not isinstance(emb, list) or not emb:
+    _TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣]+")
+    _STOPWORDS = {
+        "그리고",
+        "하지만",
+        "또는",
+        "대한",
+        "관련",
+        "것은",
+        "문항",
+        "문제",
+        "다음",
+        "정답",
+        "선택",
+        "보기",
+        "이다",
+        "하는",
+        "한다",
+        "있다",
+        "없다",
+        "에서",
+        "으로",
+        "하며",
+        "대한민국",
+        "khnp",
+    }
+    _NEGATIVE_HINTS = [
+        "아닌 것은",
+        "아닌것",
+        "옳지 않은",
+        "틀린 것은",
+        "틀린것",
+        "부적절한",
+        "거리가 먼",
+        "해당하지 않는",
+        "not",
+        "except",
+    ]
+
+    @staticmethod
+    def _clean_html_text(src: str) -> str:
+        text = re.sub(r"<script.*?>.*?</script>", " ", src, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _is_negative_question(cls, question: str) -> bool:
+        q = (question or "").lower()
+        return any(h in q for h in cls._NEGATIVE_HINTS)
+
+    @classmethod
+    def _tokenize(cls, text: str) -> list[str]:
+        tokens = [t.lower() for t in cls._TOKEN_RE.findall(text or "")]
+        return [t for t in tokens if len(t) >= 2 and t not in cls._STOPWORDS]
+
+    def _prepare_chunk_views(self, chunks: list[dict[str, object]]) -> None:
+        df: dict[str, int] = {}
+        views: list[dict[str, Any]] = []
+        for ch in chunks:
+            vec = self._extract_embedding(ch)
+            if not vec:
                 continue
-            vec = [float(x) for x in emb]
-            dot = sum(a * b for a, b in zip(q_emb, vec))
-            norm = float(ch.get("norm") or 1.0)
-            score = dot / (q_norm * norm)
-            scored.append((score, ch))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [x[1] for x in scored[: max(1, top_k)]]
+            norm = float(ch.get("norm") or 0.0)
+            if norm <= 0:
+                norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+            text = str(ch.get("text", "") or "")
+            tokens = set(self._tokenize(text))
+            for tok in tokens:
+                df[tok] = df.get(tok, 0) + 1
+            views.append({"chunk": ch, "vec": vec, "norm": norm, "tokens": tokens})
+
+        if not views:
+            raise RuntimeError("RAG index has no valid chunk vectors")
+
+        n_docs = len(views)
+        self._idf = {tok: math.log((n_docs + 1.0) / (freq + 1.0)) + 1.0 for tok, freq in df.items()}
+        self._chunk_views = views
+
+    @staticmethod
+    def _decode_emb_f16(data: str, dim: int) -> list[float]:
+        if not data:
+            return []
+        raw = base64.b64decode(data.encode("ascii"))
+        if dim <= 0:
+            dim = len(raw) // 2
+        if dim <= 0:
+            return []
+        need = dim * 2
+        if len(raw) < need:
+            return []
+        fmt = "<" + ("e" * dim)
+        vals = struct.unpack(fmt, raw[:need])
+        return [float(x) for x in vals]
+
+    def _extract_embedding(self, chunk: dict[str, object]) -> list[float]:
+        emb = chunk.get("embedding")
+        if isinstance(emb, list) and emb:
+            return [float(x) for x in emb]
+        emb_f16 = chunk.get("emb_f16")
+        if isinstance(emb_f16, str) and emb_f16:
+            try:
+                dim = int(chunk.get("dim") or 0)
+            except Exception:  # noqa: BLE001
+                dim = 0
+            try:
+                return self._decode_emb_f16(emb_f16, dim)
+            except Exception:  # noqa: BLE001
+                return []
+        return []
+
+    def _chunk_source(self, chunk: dict[str, object]) -> str:
+        source = chunk.get("source")
+        if isinstance(source, str) and source:
+            return source
+        sid = chunk.get("sid")
+        try:
+            idx = int(sid)
+        except Exception:  # noqa: BLE001
+            idx = -1
+        if 0 <= idx < len(self.sources):
+            return self.sources[idx]
+        return ""
+
+    def _embed(self, text: str) -> list[float]:
+        key = " ".join((text or "").split())
+        if key in self._embed_cache:
+            return self._embed_cache[key]
+        emb = self.client.embed(self.embed_model, key)
+        self._embed_cache[key] = emb
+        return emb
+
+    @staticmethod
+    def _cosine(q_vec: list[float], q_norm: float, d_vec: list[float], d_norm: float) -> float:
+        if q_norm <= 0 or d_norm <= 0:
+            return 0.0
+        dot = sum(a * b for a, b in zip(q_vec, d_vec))
+        return dot / (q_norm * d_norm)
+
+    def _coverage_score(self, query_tokens: list[str], doc_tokens: set[str]) -> float:
+        if not query_tokens or not doc_tokens:
+            return 0.0
+        qset = set(query_tokens)
+        matched = qset & doc_tokens
+        if not matched:
+            return 0.0
+        den = sum(self._idf.get(tok, 1.0) for tok in qset) or 1.0
+        num = sum(self._idf.get(tok, 1.0) for tok in matched)
+        return max(0.0, min(1.0, num / den))
+
+    def _search_web(self, question: str, options: list[str]) -> list[dict[str, str]]:
+        if not self.web_search_enabled:
+            return []
+
+        query = f"\"{question}\" 정답"
+        key = re.sub(r"\s+", " ", query).strip().lower()
+        if key in self._web_cache:
+            return self._web_cache[key]
+
+        url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+        req = request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                )
+            },
+            method="GET",
+        )
+
+        hits: list[dict[str, str]] = []
+        try:
+            with request.urlopen(req, timeout=self.web_timeout_sec) as resp:  # noqa: S310
+                page_html = resp.read().decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            self._web_cache[key] = []
+            return []
+
+        title_matches = re.findall(
+            r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            page_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        snippet_matches = re.findall(
+            r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
+            page_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        q_tokens = set(self._tokenize(question))
+        for idx, (raw_href, raw_title) in enumerate(title_matches):
+            if len(hits) >= self.web_top_n:
+                break
+
+            href = html.unescape(raw_href)
+            if href.startswith("//"):
+                href = "https:" + href
+            if "duckduckgo.com/l/?" in href:
+                try:
+                    qd = parse_qs(urlparse(href).query)
+                    decoded = unquote(qd.get("uddg", [""])[0])
+                    if decoded:
+                        href = decoded
+                except Exception:  # noqa: BLE001
+                    pass
+            if not href.startswith("http"):
+                continue
+
+            title = self._clean_html_text(raw_title)
+            snippet_raw = snippet_matches[idx] if idx < len(snippet_matches) else ""
+            snippet = self._clean_html_text(snippet_raw)
+            text = f"{title} {snippet}".strip()
+            if len(text) < 20:
+                continue
+
+            # 문제 토큰과의 최소 교집합이 없는 결과는 제외하여 잡음을 줄입니다.
+            hit_tokens = set(self._tokenize(text))
+            if q_tokens and not (q_tokens & hit_tokens):
+                continue
+
+            hits.append({"id": f"web#{len(hits) + 1}", "source": href, "text": text[:700]})
+
+        self._web_cache[key] = hits
+        if hits:
+            return hits
+
+        # 2차 질의: 문제 + 보기 일부로 재검색
+        alt_query = f"{question} {options[0] if options else ''} 정답"
+        alt_key = re.sub(r"\s+", " ", alt_query).strip().lower()
+        if alt_key in self._web_cache:
+            return self._web_cache[alt_key]
+        alt_url = f"https://duckduckgo.com/html/?q={quote_plus(alt_query)}"
+        alt_req = request.Request(
+            alt_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                )
+            },
+            method="GET",
+        )
+        try:
+            with request.urlopen(alt_req, timeout=self.web_timeout_sec) as resp:  # noqa: S310
+                alt_html = resp.read().decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            self._web_cache[alt_key] = []
+            return []
+
+        alt_titles = re.findall(
+            r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            alt_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        alt_snippets = re.findall(
+            r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
+            alt_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        alt_hits: list[dict[str, str]] = []
+        for idx, (raw_href, raw_title) in enumerate(alt_titles):
+            if len(alt_hits) >= self.web_top_n:
+                break
+            href = html.unescape(raw_href)
+            if href.startswith("//"):
+                href = "https:" + href
+            if "duckduckgo.com/l/?" in href:
+                try:
+                    qd = parse_qs(urlparse(href).query)
+                    decoded = unquote(qd.get("uddg", [""])[0])
+                    if decoded:
+                        href = decoded
+                except Exception:  # noqa: BLE001
+                    pass
+            if not href.startswith("http"):
+                continue
+            title = self._clean_html_text(raw_title)
+            snippet = self._clean_html_text(alt_snippets[idx] if idx < len(alt_snippets) else "")
+            text = f"{title} {snippet}".strip()
+            if len(text) < 20:
+                continue
+            alt_hits.append({"id": f"web#{len(alt_hits) + 1}", "source": href, "text": text[:700]})
+
+        self._web_cache[alt_key] = alt_hits
+        return alt_hits
+
+    @staticmethod
+    def _combine_scores(local_scores: list[float], web_scores: list[float], web_weight: float) -> list[float]:
+        if not local_scores:
+            return []
+        if not web_scores or len(web_scores) != len(local_scores):
+            return list(local_scores)
+        w = max(0.0, min(float(web_weight), 0.8))
+        return [(1.0 - w) * l + w * wv for l, wv in zip(local_scores, web_scores)]
+
+    @staticmethod
+    def _pick_choice_from_scores(scores: list[float], negative: bool) -> tuple[int, float]:
+        if not scores:
+            return 1, 0.0
+        picked = [1.0 - s for s in scores] if negative else list(scores)
+        best_idx = 1
+        best_score = -1.0
+        for i, sc in enumerate(picked, start=1):
+            if sc > best_score:
+                best_score = sc
+                best_idx = i
+
+        sorted_scores = sorted(picked, reverse=True)
+        top = sorted_scores[0] if sorted_scores else 0.0
+        second = sorted_scores[1] if len(sorted_scores) > 1 else 0.0
+        margin = max(0.0, top - second)
+        confidence = min(0.97, 0.36 + 0.42 * top + 0.52 * margin)
+        return best_idx, confidence
+
+    def _retrieve(self, question: str, options: list[str], top_k: int = 6) -> list[dict[str, Any]]:
+        option_lines = "\n".join(f"{i}. {opt}" for i, opt in enumerate(options, start=1))
+        main_query = f"{question}\n{option_lines}"
+        q_tokens_main = self._tokenize(main_query)
+
+        q_vec_main = self._embed(main_query)
+        q_norm_main = math.sqrt(sum(x * x for x in q_vec_main)) or 1.0
+
+        q_vec_question = self._embed(question)
+        q_norm_question = math.sqrt(sum(x * x for x in q_vec_question)) or 1.0
+
+        option_queries = [f"{question}\n{opt}" for opt in options]
+        option_tokens = [self._tokenize(opt) for opt in options]
+        option_vecs = [self._embed(q) for q in option_queries]
+        option_norms = [math.sqrt(sum(x * x for x in vec)) or 1.0 for vec in option_vecs]
+
+        scored: list[dict[str, Any]] = []
+        for view in self._chunk_views:
+            vec = view["vec"]
+            norm = float(view["norm"])
+            tokens: set[str] = view["tokens"]
+
+            dense_main = (self._cosine(q_vec_main, q_norm_main, vec, norm) + 1.0) / 2.0
+            dense_q = (self._cosine(q_vec_question, q_norm_question, vec, norm) + 1.0) / 2.0
+            dense_opt_best = 0.0
+            for i in range(len(option_vecs)):
+                dense_opt_best = max(
+                    dense_opt_best,
+                    (self._cosine(option_vecs[i], option_norms[i], vec, norm) + 1.0) / 2.0,
+                )
+
+            lex_main = self._coverage_score(q_tokens_main, tokens)
+            lex_opt_best = 0.0
+            for toks in option_tokens:
+                lex_opt_best = max(lex_opt_best, self._coverage_score(toks, tokens))
+
+            dense_score = 0.55 * dense_main + 0.25 * dense_q + 0.20 * dense_opt_best
+            lex_score = 0.70 * lex_main + 0.30 * lex_opt_best
+            hybrid_score = 0.72 * dense_score + 0.28 * lex_score
+
+            scored.append(
+                {
+                    "chunk": view["chunk"],
+                    "vec": vec,
+                    "norm": norm,
+                    "tokens": tokens,
+                    "dense": dense_score,
+                    "lex": lex_score,
+                    "score": hybrid_score,
+                }
+            )
+
+        scored.sort(key=lambda x: float(x["score"]), reverse=True)
+        return scored[: max(1, top_k)]
 
     @staticmethod
     def _parse_model_json(text: str) -> Optional[dict[str, object]]:
@@ -118,18 +491,57 @@ class RagExamSolver:
             return None
         return obj if isinstance(obj, dict) else None
 
-    @staticmethod
-    def _fallback_choice(options: list[str], contexts: list[dict[str, object]]) -> int:
-        joined = " ".join(str(c.get("text", "")) for c in contexts)
-        best_idx = 1
-        best_score = -1
-        for i, opt in enumerate(options, start=1):
-            words = [w for w in re.findall(r"[0-9A-Za-z가-힣]+", opt) if len(w) >= 2]
-            score = sum(joined.count(w) for w in words)
-            if score > best_score:
-                best_score = score
-                best_idx = i
-        return best_idx
+    def _score_options(self, question: str, options: list[str], contexts: list[dict[str, Any]]) -> list[float]:
+        if not options:
+            return []
+
+        query_texts = [f"{question}\n{opt}" for opt in options]
+        query_tokens = [self._tokenize(qt) for qt in query_texts]
+        query_vecs = [self._embed(qt) for qt in query_texts]
+        query_norms = [math.sqrt(sum(x * x for x in vec)) or 1.0 for vec in query_vecs]
+
+        scores: list[float] = []
+        for idx in range(len(options)):
+            total_weight = 0.0
+            acc = 0.0
+            for rank, ctx in enumerate(contexts):
+                weight = 1.0 / (1.0 + rank * 0.30)
+                total_weight += weight
+
+                dense = (self._cosine(query_vecs[idx], query_norms[idx], ctx["vec"], float(ctx["norm"])) + 1.0) / 2.0
+                lex = self._coverage_score(query_tokens[idx], ctx["tokens"])
+                ctx_score = float(ctx.get("score", 0.0))
+
+                local = 0.60 * dense + 0.25 * lex + 0.15 * ctx_score
+                acc += weight * local
+            scores.append((acc / total_weight) if total_weight > 0 else 0.0)
+
+        return scores
+
+    def _score_options_from_web_hits(
+        self, question: str, options: list[str], web_hits: list[dict[str, str]]
+    ) -> list[float]:
+        if not options:
+            return []
+        if not web_hits:
+            return [0.0 for _ in options]
+
+        hit_tokens = [set(self._tokenize(hit.get("text", ""))) for hit in web_hits]
+        scores: list[float] = []
+        for idx, opt in enumerate(options):
+            q_tokens = self._tokenize(f"{question} {opt}")
+            if not q_tokens:
+                scores.append(0.0)
+                continue
+            acc = 0.0
+            total_w = 0.0
+            for rank, ht in enumerate(hit_tokens):
+                w = 1.0 / (1.0 + rank * 0.35)
+                total_w += w
+                overlap = self._coverage_score(q_tokens, ht)
+                acc += w * overlap
+            scores.append((acc / total_w) if total_w > 0 else 0.0)
+        return scores
 
     def solve(self, question: str, options: list[str], top_k: int = 6) -> SolveResult:
         if not question.strip():
@@ -138,45 +550,103 @@ class RagExamSolver:
             raise RuntimeError("Need at least 2 options")
 
         option_lines = "\n".join(f"{i}. {opt}" for i, opt in enumerate(options, start=1))
-        query = f"{question}\n{option_lines}"
-        contexts = self._retrieve(query=query, top_k=top_k)
+        contexts = self._retrieve(question=question, options=options, top_k=top_k)
+        if not contexts:
+            raise RuntimeError("No retrieved contexts")
+
+        local_scores = self._score_options(question, options, contexts)
+        web_hits = self._search_web(question=question, options=options)
+        web_scores = self._score_options_from_web_hits(question=question, options=options, web_hits=web_hits)
+        option_scores = self._combine_scores(local_scores=local_scores, web_scores=web_scores, web_weight=self.web_weight)
+        negative_question = self._is_negative_question(question)
+        det_choice, det_conf = self._pick_choice_from_scores(option_scores, negative=negative_question)
+
         evidence_lines = []
         for idx, c in enumerate(contexts, start=1):
-            evidence_lines.append(f"[{idx}] id={c.get('id')} source={c.get('source')}\n{c.get('text')}")
+            chunk = c["chunk"]
+            src = self._chunk_source(chunk)
+            evidence_lines.append(
+                f"[{idx}] id={chunk.get('id')} source={src} score={float(c.get('score', 0.0)):.3f}\n"
+                f"{chunk.get('text')}"
+            )
+        offset = len(evidence_lines)
+        for widx, hit in enumerate(web_hits, start=1):
+            evidence_lines.append(
+                f"[{offset + widx}] id={hit.get('id')} source={hit.get('source')}\n"
+                f"{hit.get('text')}"
+            )
+        evidence_block = "\n\n".join(evidence_lines)
+        option_score_lines = "\n".join(
+            (
+                f"{i}. local={local_scores[i - 1]:.3f} "
+                f"web={web_scores[i - 1]:.3f} "
+                f"combined={option_scores[i - 1]:.3f} "
+                f"option={options[i - 1]}"
+            )
+            for i in range(1, len(options) + 1)
+        )
+        q_type = "부정형(아닌/틀린/거리가 먼 유형)" if negative_question else "일반형"
+        web_rule = "반드시 웹검색 근거를 우선 참조하고, 로컬 근거와 교차검증"
         prompt = (
             "당신은 객관식 문제 풀이 도우미다.\n"
-            "반드시 근거 문서만 기반으로 답하라.\n"
+            "반드시 근거 문서(웹검색+로컬)를 기반으로 답하라. 근거가 약하면 confidence를 낮춰라.\n"
+            "웹검색 스니펫을 반드시 참조하고 로컬 근거와 충돌 여부를 확인하라.\n"
+            "문항이 부정형이면(아닌/틀린/거리가 먼) 정답은 일반적으로 '근거와 가장 덜 일치하는' 선지다.\n"
+            f"규칙: {web_rule}\n"
             "출력은 JSON 한 개만:\n"
             '{"choice": <1-5 정수>, "confidence": <0~1>, "reason": "<짧은 근거>", "evidence_ids": ["id1","id2"]}\n\n'
             f"문제:\n{question}\n\n"
+            f"문항 유형:\n{q_type}\n\n"
             f"선지:\n{option_lines}\n\n"
-            f"근거 문서:\n{'\n\n'.join(evidence_lines)}\n"
+            f"선지별 검색 점수(참고):\n{option_score_lines}\n\n"
+            f"근거 문서:\n{evidence_block}\n"
         )
         raw = self.client.generate(self.generate_model, prompt, temperature=0.1)
         parsed = self._parse_model_json(raw)
 
         if parsed is None:
-            fallback = self._fallback_choice(options, contexts)
+            fallback_eids = [str(c["chunk"].get("id", "")) for c in contexts[:2] if c["chunk"].get("id")]
+            if web_hits:
+                fallback_eids.append(str(web_hits[0].get("id", "")))
+            fallback_eids = [x for x in fallback_eids if x]
             return SolveResult(
-                choice=fallback,
-                confidence=0.45,
-                reason="LLM JSON 파싱 실패, 근거 단어 겹침 기반 폴백",
-                evidence_ids=[str(c.get("id", "")) for c in contexts[:2] if c.get("id")],
+                choice=det_choice,
+                confidence=max(0.45, det_conf),
+                reason="LLM JSON 파싱 실패, 하이브리드 검색 점수 폴백",
+                evidence_ids=fallback_eids,
             )
 
         choice = int(parsed.get("choice", 0) or 0)
-        confidence = float(parsed.get("confidence", 0.0) or 0.0)
+        model_conf = float(parsed.get("confidence", 0.0) or 0.0)
+        model_conf = max(0.0, min(1.0, model_conf))
         reason = str(parsed.get("reason", "") or "")
         eids_raw = parsed.get("evidence_ids", [])
         evidence_ids = [str(x) for x in eids_raw] if isinstance(eids_raw, list) else []
 
         if choice < 1 or choice > len(options):
-            choice = self._fallback_choice(options, contexts)
-            confidence = min(confidence, 0.55)
+            choice = det_choice
+            model_conf = min(model_conf, det_conf)
             if not reason:
-                reason = "선택지 번호 비정상으로 폴백 적용"
+                reason = "선택지 번호 비정상으로 하이브리드 폴백 적용"
 
+        final_choice = choice
+        final_conf = model_conf
+        if choice == det_choice:
+            final_conf = max(model_conf, det_conf)
+        elif det_conf >= model_conf + 0.10:
+            final_choice = det_choice
+            final_conf = det_conf
+            reason = f"LLM-검색 불일치로 근거 점수 우세 선택지를 채택. {reason}".strip()
+        else:
+            final_conf = min(1.0, max(model_conf, det_conf * 0.85))
+
+        allowed_ids = {str(c["chunk"].get("id", "")) for c in contexts if c["chunk"].get("id")}
+        allowed_ids.update(str(h.get("id", "")) for h in web_hits if h.get("id"))
+        evidence_ids = [eid for eid in evidence_ids if eid in allowed_ids]
         if not evidence_ids:
-            evidence_ids = [str(c.get("id", "")) for c in contexts[:2] if c.get("id")]
+            evidence_ids = [str(c["chunk"].get("id", "")) for c in contexts[:2] if c["chunk"].get("id")]
+            if web_hits:
+                evidence_ids.append(str(web_hits[0].get("id", "")))
+            evidence_ids = [x for x in evidence_ids if x]
 
-        return SolveResult(choice=choice, confidence=confidence, reason=reason, evidence_ids=evidence_ids)
+        return SolveResult(choice=final_choice, confidence=final_conf, reason=reason, evidence_ids=evidence_ids)

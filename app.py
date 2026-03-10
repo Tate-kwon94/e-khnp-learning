@@ -52,16 +52,16 @@ def main() -> None:
     with milestone_cols[3]:
         st.metric(
             "M4 강의 재생·완료처리",
-            "89%",
+            "94%",
             help="차시 진행률 판독 + 파란색 완료 확인 + 우하단 Next로 다음 차시 반복 처리",
         )
     with milestone_cols[4]:
         st.metric(
             "M5 수료 순서 자동화",
-            "74%",
-            help="진도율→시험평가→학습시간 보충(강의실 새로고침 체크) 워크플로우",
+            "90%",
+            help="원클릭 실행 + 진도율→시험평가→학습시간 보충 + 1차시 직접진입/동적시간체크 + 시험없음/응시보존/정답지 인덱싱 재응시",
         )
-    st.progress(0.93, text="전체 진행률 93%")
+    st.progress(0.97, text="전체 진행률 97%")
 
     st.subheader("로그인 정보 입력")
     input_col1, input_col2 = st.columns(2)
@@ -119,11 +119,56 @@ def main() -> None:
             format="%.2f",
         )
     )
+    rag_web_search_enabled = st.checkbox(
+        "웹 검색 강제 참조",
+        value=True,
+        disabled=True,
+        help="문항 풀이 시 웹 검색 결과를 항상 참조합니다. (고정)",
+    )
+    rag_web_top_n = int(
+        st.number_input("웹 검색 상위 결과 수", min_value=1, max_value=8, value=settings.rag_web_top_n, step=1)
+    )
+    rag_web_timeout_sec = int(
+        st.number_input("웹 검색 타임아웃(초)", min_value=3, max_value=20, value=settings.rag_web_timeout_sec, step=1)
+    )
+    rag_web_weight = float(
+        st.number_input(
+            "웹 점수 가중치",
+            min_value=0.0,
+            max_value=0.8,
+            value=settings.rag_web_weight,
+            step=0.05,
+            format="%.2f",
+        )
+    )
     timefill_check_interval_min = int(
-        st.number_input("학습시간 부족 체크 간격(분)", min_value=1, max_value=60, value=10, step=1)
+        st.number_input(
+            "학습시간 부족 체크 기본 간격(분, 실제 5~10분 동적)",
+            min_value=1,
+            max_value=60,
+            value=10,
+            step=1,
+        )
     )
     timefill_check_limit = int(
         st.number_input("학습시간 부족 체크 최대 횟수", min_value=1, max_value=72, value=24, step=1)
+    )
+    completion_max_courses = int(
+        st.number_input("수료 자동 최대 과정 수", min_value=1, max_value=40, value=settings.completion_max_courses, step=1)
+    )
+    exam_answer_bank_path = st.text_input("시험 정답 인덱스 파일", value=settings.exam_answer_bank_path)
+    exam_auto_retry_max = int(
+        st.number_input("시험 자동 재응시 최대 횟수", min_value=0, max_value=4, value=settings.exam_auto_retry_max, step=1)
+    )
+    exam_retry_requires_answer_index = st.checkbox(
+        "정답 인덱스 없으면 재응시 중단",
+        value=settings.exam_retry_requires_answer_index,
+        help="점수 미달 시 결과지에서 정답 인덱싱이 되지 않으면 자동 재응시를 중단합니다.",
+    )
+    one_click_force_reindex = st.checkbox(
+        "원클릭 실행 시 RAG 인덱스 강제 재생성",
+        value=False,
+        help="체크 시 인덱스 파일이 있어도 다시 생성합니다.",
     )
 
     st.subheader("설정 확인")
@@ -142,7 +187,29 @@ def main() -> None:
             "rag_generate_model": rag_generate_model,
             "rag_top_k": rag_top_k,
             "rag_conf_threshold": rag_conf_threshold,
+            "rag_chunk_size": settings.rag_chunk_size,
+            "rag_chunk_overlap": settings.rag_chunk_overlap,
+            "rag_min_chunk_chars": settings.rag_min_chunk_chars,
+            "rag_max_chunks": settings.rag_max_chunks,
+            "rag_storage_limit_gb": settings.rag_storage_limit_gb,
+            "rag_prune_old_indexes": settings.rag_prune_old_indexes,
+            "rag_pass_score": settings.rag_pass_score,
+            "rag_low_conf_floor": settings.rag_low_conf_floor,
+            "rag_web_search_enabled": rag_web_search_enabled,
+            "rag_web_top_n": rag_web_top_n,
+            "rag_web_timeout_sec": rag_web_timeout_sec,
+            "rag_web_weight": rag_web_weight,
+            "completion_max_courses": completion_max_courses,
+            "exam_answer_bank_path": exam_answer_bank_path,
+            "exam_auto_retry_max": exam_auto_retry_max,
+            "exam_retry_requires_answer_index": exam_retry_requires_answer_index,
         }
+    )
+
+    run_one_click = st.button(
+        "원클릭 전체 자동 실행 (인덱스 확인 → 수료 자동)",
+        type="primary",
+        use_container_width=True,
     )
 
     col1, col2, col3, col4, col5, col6, col7, col8, col9 = st.columns(9)
@@ -153,7 +220,7 @@ def main() -> None:
     with col3:
         run_first_course = st.button("첫 과목 학습 시작", use_container_width=True)
     with col4:
-        run_complete_lesson = st.button("첫 과목 모든 차시 완료(반복)", use_container_width=True)
+        run_complete_lesson = st.button("강의 순차 완료(첫 행→다음)", use_container_width=True)
     with col5:
         run_exam_probe = st.button("종합평가 텍스트 탐침", use_container_width=True)
     with col6:
@@ -165,6 +232,72 @@ def main() -> None:
     with col9:
         if st.button("로그 초기화", use_container_width=True):
             st.session_state.logs = []
+
+    if run_one_click:
+        append_log("원클릭 전체 자동 실행을 시작합니다. (필요 시 인덱스 생성 → 수료 자동)")
+        settings.user_id = user_id_input.strip()
+        settings.user_password = user_password_input
+        settings.headless = not show_browser
+        settings.completion_max_courses = completion_max_courses
+        settings.rag_docs_dir = rag_docs_dir.strip()
+        settings.rag_index_path = rag_index_path.strip()
+        settings.rag_embed_model = rag_embed_model.strip()
+        settings.rag_generate_model = rag_generate_model.strip()
+        settings.rag_top_k = rag_top_k
+        settings.rag_conf_threshold = rag_conf_threshold
+        settings.rag_web_search_enabled = rag_web_search_enabled
+        settings.rag_web_top_n = rag_web_top_n
+        settings.rag_web_timeout_sec = rag_web_timeout_sec
+        settings.rag_web_weight = rag_web_weight
+        settings.exam_answer_bank_path = exam_answer_bank_path.strip()
+        settings.exam_auto_retry_max = exam_auto_retry_max
+        settings.exam_retry_requires_answer_index = exam_retry_requires_answer_index
+
+        index_path = Path(settings.rag_index_path) if settings.rag_index_path else None
+        need_reindex = bool(one_click_force_reindex)
+        if index_path is not None and not index_path.exists():
+            need_reindex = True
+            append_log(f"RAG 인덱스 파일이 없어 자동 생성합니다: {index_path}")
+
+        one_click_blocked = False
+        if need_reindex:
+            try:
+                from rag_index import build_rag_index
+
+                index_result = build_rag_index(
+                    docs_dir=settings.rag_docs_dir,
+                    index_path=settings.rag_index_path,
+                    embed_model=settings.rag_embed_model,
+                    chunk_size=settings.rag_chunk_size,
+                    overlap=settings.rag_chunk_overlap,
+                    min_chunk_chars=settings.rag_min_chunk_chars,
+                    max_chunks=settings.rag_max_chunks,
+                    max_total_size_gb=settings.rag_storage_limit_gb,
+                    prune_old_indexes=settings.rag_prune_old_indexes,
+                    ollama_base_url=settings.ollama_base_url,
+                    log_fn=append_log,
+                )
+                append_log(
+                    "원클릭 사전 인덱싱 완료: "
+                    f"files={index_result.get('files')} chunks={index_result.get('chunks')} "
+                    f"path={index_result.get('index_path')}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                one_click_blocked = True
+                st.error(f"원클릭 중 RAG 인덱스 생성 실패: {exc}")
+                append_log(f"원클릭 중 RAG 인덱스 생성 실패: {exc}")
+
+        if not one_click_blocked:
+            automator = EKHNPAutomator(settings, log_fn=append_log)
+            result = automator.login_and_run_completion_workflow(
+                check_interval_minutes=timefill_check_interval_min,
+                max_timefill_checks=timefill_check_limit,
+            )
+            if result.success:
+                st.success(result.message)
+            else:
+                st.error(result.message)
+            append_log(f"결과: {result.message} / url={result.current_url}")
 
     if run_login:
         append_log("로그인 테스트를 시작합니다.")
@@ -206,7 +339,7 @@ def main() -> None:
         append_log(f"결과: {result.message} / url={result.current_url}")
 
     if run_complete_lesson:
-        append_log("로그인 + 첫 과목 진입 + 모든 차시 반복 자동 진행을 시작합니다.")
+        append_log("로그인 + 강의 목록 첫 행부터 순차 진입 + 차시 자동 완료를 시작합니다.")
         settings.user_id = user_id_input.strip()
         settings.user_password = user_password_input
         settings.headless = not show_browser
@@ -245,6 +378,20 @@ def main() -> None:
         settings.user_id = user_id_input.strip()
         settings.user_password = user_password_input
         settings.headless = not show_browser
+        settings.completion_max_courses = completion_max_courses
+        settings.rag_docs_dir = rag_docs_dir.strip()
+        settings.rag_index_path = rag_index_path.strip()
+        settings.rag_embed_model = rag_embed_model.strip()
+        settings.rag_generate_model = rag_generate_model.strip()
+        settings.rag_top_k = rag_top_k
+        settings.rag_conf_threshold = rag_conf_threshold
+        settings.rag_web_search_enabled = rag_web_search_enabled
+        settings.rag_web_top_n = rag_web_top_n
+        settings.rag_web_timeout_sec = rag_web_timeout_sec
+        settings.rag_web_weight = rag_web_weight
+        settings.exam_answer_bank_path = exam_answer_bank_path.strip()
+        settings.exam_auto_retry_max = exam_auto_retry_max
+        settings.exam_retry_requires_answer_index = exam_retry_requires_answer_index
         automator = EKHNPAutomator(settings, log_fn=append_log)
         result = automator.login_and_run_completion_workflow(
             check_interval_minutes=timefill_check_interval_min,
@@ -268,6 +415,12 @@ def main() -> None:
                 docs_dir=settings.rag_docs_dir,
                 index_path=settings.rag_index_path,
                 embed_model=settings.rag_embed_model,
+                chunk_size=settings.rag_chunk_size,
+                overlap=settings.rag_chunk_overlap,
+                min_chunk_chars=settings.rag_min_chunk_chars,
+                max_chunks=settings.rag_max_chunks,
+                max_total_size_gb=settings.rag_storage_limit_gb,
+                prune_old_indexes=settings.rag_prune_old_indexes,
                 ollama_base_url=settings.ollama_base_url,
                 log_fn=append_log,
             )
@@ -292,6 +445,13 @@ def main() -> None:
         settings.rag_generate_model = rag_generate_model.strip()
         settings.rag_top_k = rag_top_k
         settings.rag_conf_threshold = rag_conf_threshold
+        settings.rag_web_search_enabled = rag_web_search_enabled
+        settings.rag_web_top_n = rag_web_top_n
+        settings.rag_web_timeout_sec = rag_web_timeout_sec
+        settings.rag_web_weight = rag_web_weight
+        settings.exam_answer_bank_path = exam_answer_bank_path.strip()
+        settings.exam_auto_retry_max = exam_auto_retry_max
+        settings.exam_retry_requires_answer_index = exam_retry_requires_answer_index
         automator = EKHNPAutomator(settings, log_fn=append_log)
         result = automator.login_and_solve_exam_with_rag(
             max_questions=60,
