@@ -9,3 +9,5 @@ artifacts/
 .streamlit/
 playwright-report/
 test-results/
+rag/
+rag_data/

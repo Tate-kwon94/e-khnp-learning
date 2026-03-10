@@ -22,7 +22,7 @@ def append_log(message: str) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="e-KHNP Automation", layout="wide")
-    st.title("e-KHNP Automation (M3 Prototype)")
+    st.title("e-KHNP Automation (M5 Workflow Prototype)")
 
     if "logs" not in st.session_state:
         st.session_state.logs = []
@@ -30,7 +30,7 @@ def main() -> None:
     settings = Settings()
 
     st.subheader("마일스톤 진행 현황")
-    milestone_cols = st.columns(4)
+    milestone_cols = st.columns(5)
     with milestone_cols[0]:
         st.metric(
             "M1 프로젝트 골격",
@@ -40,22 +40,28 @@ def main() -> None:
     with milestone_cols[1]:
         st.metric(
             "M2 로그인 자동화",
-            "95%",
+            "98%",
             help="로그인 선택자 보정 및 성공/실패 판정 로직 완료",
         )
     with milestone_cols[2]:
         st.metric(
             "M3 학습현황·첫과목 진입",
-            "90%",
+            "96%",
             help="나의 학습현황 이동 + 수강과정 첫 행 학습하기 클릭/강의실 진입 확인",
         )
     with milestone_cols[3]:
         st.metric(
             "M4 강의 재생·완료처리",
-            "78%",
+            "89%",
             help="차시 진행률 판독 + 파란색 완료 확인 + 우하단 Next로 다음 차시 반복 처리",
         )
-    st.progress(0.88, text="전체 진행률 88%")
+    with milestone_cols[4]:
+        st.metric(
+            "M5 수료 순서 자동화",
+            "74%",
+            help="진도율→시험평가→학습시간 보충(강의실 새로고침 체크) 워크플로우",
+        )
+    st.progress(0.93, text="전체 진행률 93%")
 
     st.subheader("로그인 정보 입력")
     input_col1, input_col2 = st.columns(2)
@@ -98,6 +104,21 @@ def main() -> None:
     exam_probe_limit = int(
         st.number_input("종합평가 탐침 최대 문항 수", min_value=1, max_value=60, value=12, step=1)
     )
+    rag_docs_dir = st.text_input("RAG 문서 폴더", value=settings.rag_docs_dir)
+    rag_index_path = st.text_input("RAG 인덱스 파일", value=settings.rag_index_path)
+    rag_embed_model = st.text_input("RAG 임베딩 모델", value=settings.rag_embed_model)
+    rag_generate_model = st.text_input("RAG 생성 모델", value=settings.rag_generate_model)
+    rag_top_k = int(st.number_input("RAG top-k", min_value=1, max_value=20, value=settings.rag_top_k, step=1))
+    rag_conf_threshold = float(
+        st.number_input(
+            "RAG 신뢰도 임계치",
+            min_value=0.0,
+            max_value=1.0,
+            value=settings.rag_conf_threshold,
+            step=0.01,
+            format="%.2f",
+        )
+    )
     timefill_check_interval_min = int(
         st.number_input("학습시간 부족 체크 간격(분)", min_value=1, max_value=60, value=10, step=1)
     )
@@ -114,10 +135,17 @@ def main() -> None:
             "timeout_ms": settings.timeout_ms,
             "user_id_set": bool(user_id_input),
             "user_password_set": bool(user_password_input),
+            "ollama_base_url": settings.ollama_base_url,
+            "rag_docs_dir": rag_docs_dir,
+            "rag_index_path": rag_index_path,
+            "rag_embed_model": rag_embed_model,
+            "rag_generate_model": rag_generate_model,
+            "rag_top_k": rag_top_k,
+            "rag_conf_threshold": rag_conf_threshold,
         }
     )
 
-    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
+    col1, col2, col3, col4, col5, col6, col7, col8, col9 = st.columns(9)
     with col1:
         run_login = st.button("로그인 테스트 실행", use_container_width=True)
     with col2:
@@ -131,6 +159,10 @@ def main() -> None:
     with col6:
         run_completion_flow = st.button("수료 순서 자동(진도→시험→시간)", use_container_width=True)
     with col7:
+        run_rag_index = st.button("RAG 인덱스 생성", use_container_width=True)
+    with col8:
+        run_exam_rag_solve = st.button("종합평가 LLM 풀이(RAG)", use_container_width=True)
+    with col9:
         if st.button("로그 초기화", use_container_width=True):
             st.session_state.logs = []
 
@@ -217,6 +249,54 @@ def main() -> None:
         result = automator.login_and_run_completion_workflow(
             check_interval_minutes=timefill_check_interval_min,
             max_timefill_checks=timefill_check_limit,
+        )
+        if result.success:
+            st.success(result.message)
+        else:
+            st.error(result.message)
+        append_log(f"결과: {result.message} / url={result.current_url}")
+
+    if run_rag_index:
+        append_log("RAG 인덱스 생성을 시작합니다.")
+        settings.rag_docs_dir = rag_docs_dir.strip()
+        settings.rag_index_path = rag_index_path.strip()
+        settings.rag_embed_model = rag_embed_model.strip()
+        try:
+            from rag_index import build_rag_index
+
+            result = build_rag_index(
+                docs_dir=settings.rag_docs_dir,
+                index_path=settings.rag_index_path,
+                embed_model=settings.rag_embed_model,
+                ollama_base_url=settings.ollama_base_url,
+                log_fn=append_log,
+            )
+            st.success(
+                f"RAG 인덱스 완료: files={result.get('files')} chunks={result.get('chunks')} path={result.get('index_path')}"
+            )
+            append_log(
+                f"결과: RAG 인덱스 완료 files={result.get('files')} chunks={result.get('chunks')} path={result.get('index_path')}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"RAG 인덱스 실패: {exc}")
+            append_log(f"결과: RAG 인덱스 실패: {exc}")
+
+    if run_exam_rag_solve:
+        append_log("종합평가 LLM 풀이(RAG) 실행을 시작합니다.")
+        settings.user_id = user_id_input.strip()
+        settings.user_password = user_password_input
+        settings.headless = not show_browser
+        settings.rag_docs_dir = rag_docs_dir.strip()
+        settings.rag_index_path = rag_index_path.strip()
+        settings.rag_embed_model = rag_embed_model.strip()
+        settings.rag_generate_model = rag_generate_model.strip()
+        settings.rag_top_k = rag_top_k
+        settings.rag_conf_threshold = rag_conf_threshold
+        automator = EKHNPAutomator(settings, log_fn=append_log)
+        result = automator.login_and_solve_exam_with_rag(
+            max_questions=60,
+            rag_top_k=rag_top_k,
+            confidence_threshold=rag_conf_threshold,
         )
         if result.success:
             st.success(result.message)

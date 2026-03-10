@@ -1,5 +1,9 @@
 from dataclasses import dataclass
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from typing import Any, Callable, Optional
 
 from playwright.sync_api import Frame
@@ -27,6 +31,8 @@ class EKHNPAutomator:
         self.log_fn = log_fn
         self._detected_total_lessons: Optional[int] = None
         self._exam_gate_blocked: bool = False
+        self._tesseract_path: Optional[str] = None
+        self._ocr_unavailable_logged: bool = False
 
     def _log(self, message: str) -> None:
         if self.log_fn:
@@ -368,6 +374,236 @@ class EKHNPAutomator:
                 context.close()
                 browser.close()
 
+    def login_and_check_learning_progress(self) -> LoginResult:
+        if not self.settings.user_id or not self.settings.user_password:
+            return LoginResult(False, "환경변수에 EKHNP_USER_ID / EKHNP_USER_PASSWORD를 설정하세요.")
+
+        self._log("브라우저를 시작합니다.")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=self.settings.headless)
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_default_timeout(self.settings.timeout_ms)
+            dialog_messages: list[str] = []
+            page.on("dialog", lambda dialog: self._handle_dialog(dialog, dialog_messages))
+
+            try:
+                page.goto(self.settings.login_url, wait_until="commit")
+                self._log(f"로그인 페이지 이동: {self.settings.login_url}")
+                if not self._wait_login_form_ready(page):
+                    return LoginResult(False, "로그인 폼 로딩 타임아웃", page.url)
+
+                id_candidates = [
+                    "#j_userId",
+                    'input[name="j_userId"]',
+                    'input[placeholder*="사번 또는 아이디"]',
+                    'input[name="id"]',
+                    'input[name="userId"]',
+                    'input[type="text"]',
+                ]
+                pw_candidates = [
+                    "#j_password",
+                    'input[name="j_password"]',
+                    'input[placeholder*="비밀번호를 입력해 주세요"]',
+                    'input[name="password"]',
+                    'input[name="userPw"]',
+                    'input[type="password"]',
+                ]
+                submit_candidates = [
+                    "a.btn-login",
+                    'a[onclick*="doLogin"]',
+                    'button[type="submit"]',
+                    'input[type="submit"]',
+                    'button:has-text("로그인")',
+                    'a:has-text("로그인")',
+                ]
+
+                id_filled = self._fill_first_visible(page, id_candidates, self.settings.user_id)
+                pw_filled = self._fill_first_visible(page, pw_candidates, self.settings.user_password)
+                submitted = self._click_first_visible(page, submit_candidates)
+
+                if not id_filled or not pw_filled:
+                    return LoginResult(False, "로그인 입력창을 찾지 못했습니다.", page.url)
+                if not submitted:
+                    now_url = page.url
+                    if (
+                        "login/process.do" in now_url
+                        or "param=success" in now_url
+                        or "loginpage.do" not in now_url
+                    ):
+                        self._log("로그인 버튼 감지는 실패했지만 로그인 처리 URL 변화를 감지했습니다.")
+                    else:
+                        return LoginResult(False, "로그인 버튼을 찾지 못했습니다.", page.url)
+
+                login_result = self._wait_login_result(page, dialog_messages)
+                if not login_result.success:
+                    return login_result
+
+                status_result = self._open_learning_status(page)
+                if not status_result.success:
+                    return status_result
+
+                classroom_result, classroom_page = self._open_first_course_classroom_internal(page)
+                if not classroom_result.success or classroom_page is None:
+                    return classroom_result
+
+                self._refresh_classroom_page(classroom_page)
+                progress_status = self._extract_learning_progress_status(classroom_page)
+                cur = int(progress_status.get("current_percent", 0))
+                req = int(progress_status.get("required_percent", 0))
+                inc = int(progress_status.get("incomplete_count", 0))
+                return LoginResult(
+                    True,
+                    f"학습진도율 {cur}% / 수료기준 {req}% / 미완료 {inc}개",
+                    classroom_page.url,
+                )
+            except PlaywrightTimeoutError:
+                return LoginResult(False, "타임아웃이 발생했습니다.", page.url)
+            except Exception as exc:  # noqa: BLE001
+                return LoginResult(False, f"오류 발생: {exc}", page.url)
+            finally:
+                context.close()
+                browser.close()
+
+    def login_and_solve_exam_with_rag(
+        self,
+        max_questions: int = 60,
+        rag_top_k: Optional[int] = None,
+        confidence_threshold: Optional[float] = None,
+    ) -> LoginResult:
+        if not self.settings.user_id or not self.settings.user_password:
+            return LoginResult(False, "환경변수에 EKHNP_USER_ID / EKHNP_USER_PASSWORD를 설정하세요.")
+
+        try:
+            from rag_solver import RagExamSolver
+        except Exception as exc:  # noqa: BLE001
+            return LoginResult(False, f"RAG 솔버 로딩 실패: {exc}")
+
+        top_k = rag_top_k if rag_top_k is not None else self.settings.rag_top_k
+        conf_th = confidence_threshold if confidence_threshold is not None else self.settings.rag_conf_threshold
+        safe_max_questions = max(1, min(max_questions, 120))
+        solver = RagExamSolver(
+            index_path=self.settings.rag_index_path,
+            generate_model=self.settings.rag_generate_model,
+            embed_model=self.settings.rag_embed_model,
+            ollama_base_url=self.settings.ollama_base_url,
+        )
+
+        self._log("브라우저를 시작합니다.")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=self.settings.headless)
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_default_timeout(self.settings.timeout_ms)
+            dialog_messages: list[str] = []
+            page.on("dialog", lambda dialog: self._handle_dialog(dialog, dialog_messages))
+
+            try:
+                page.goto(self.settings.login_url, wait_until="commit")
+                self._log(f"로그인 페이지 이동: {self.settings.login_url}")
+                if not self._wait_login_form_ready(page):
+                    return LoginResult(False, "로그인 폼 로딩 타임아웃", page.url)
+
+                id_candidates = [
+                    "#j_userId",
+                    'input[name="j_userId"]',
+                    'input[placeholder*="사번 또는 아이디"]',
+                    'input[name="id"]',
+                    'input[name="userId"]',
+                    'input[type="text"]',
+                ]
+                pw_candidates = [
+                    "#j_password",
+                    'input[name="j_password"]',
+                    'input[placeholder*="비밀번호를 입력해 주세요"]',
+                    'input[name="password"]',
+                    'input[name="userPw"]',
+                    'input[type="password"]',
+                ]
+                submit_candidates = [
+                    "a.btn-login",
+                    'a[onclick*="doLogin"]',
+                    'button[type="submit"]',
+                    'input[type="submit"]',
+                    'button:has-text("로그인")',
+                    'a:has-text("로그인")',
+                ]
+
+                id_filled = self._fill_first_visible(page, id_candidates, self.settings.user_id)
+                pw_filled = self._fill_first_visible(page, pw_candidates, self.settings.user_password)
+                submitted = self._click_first_visible(page, submit_candidates)
+
+                if not id_filled or not pw_filled:
+                    return LoginResult(False, "로그인 입력창을 찾지 못했습니다.", page.url)
+                if not submitted:
+                    now_url = page.url
+                    if (
+                        "login/process.do" in now_url
+                        or "param=success" in now_url
+                        or "loginpage.do" not in now_url
+                    ):
+                        self._log("로그인 버튼 감지는 실패했지만 로그인 처리 URL 변화를 감지했습니다.")
+                    else:
+                        return LoginResult(False, "로그인 버튼을 찾지 못했습니다.", page.url)
+
+                login_result = self._wait_login_result(page, dialog_messages)
+                if not login_result.success:
+                    return login_result
+
+                status_result = self._open_learning_status(page)
+                if not status_result.success:
+                    return status_result
+
+                classroom_result, classroom_page = self._open_first_course_classroom_internal(page)
+                if not classroom_result.success or classroom_page is None:
+                    return classroom_result
+
+                self._refresh_classroom_page(classroom_page)
+                progress = self._extract_learning_progress_status(classroom_page)
+                cur_pct = int(progress.get("current_percent", 0))
+                if 0 < cur_pct < 80:
+                    return LoginResult(
+                        False,
+                        f"종합평가 응시 조건 미달: 학습진도율 {cur_pct}% (최소 80% 필요)",
+                        classroom_page.url,
+                    )
+
+                exam_page = self._open_comprehensive_exam_popup(classroom_page)
+                if exam_page is None and self._exam_gate_blocked:
+                    return LoginResult(
+                        False,
+                        "종합평가 응시 제한(학습진도율 80%) 팝업 감지. 먼저 미완료 차시를 진행해 주세요.",
+                        classroom_page.url,
+                    )
+                if exam_page is None:
+                    return LoginResult(False, "종합평가 응시 팝업을 찾지 못했습니다.", classroom_page.url)
+
+                solve_result = self._solve_exam_stream_with_rag(
+                    exam_page=exam_page,
+                    solver=solver,
+                    max_questions=safe_max_questions,
+                    top_k=max(1, int(top_k)),
+                    confidence_threshold=float(conf_th),
+                )
+                if not solve_result.get("success"):
+                    return LoginResult(False, str(solve_result.get("message", "시험 자동풀이 실패")), exam_page.url)
+
+                if not self._wait_exam_finished(exam_page, timeout_ms=2 * 60 * 1000):
+                    return LoginResult(False, "시험 자동풀이 후 완료 화면을 확인하지 못했습니다.", exam_page.url)
+
+                return LoginResult(
+                    True,
+                    f"종합평가 자동풀이 완료: solved={solve_result.get('solved', 0)}",
+                    exam_page.url,
+                )
+            except PlaywrightTimeoutError:
+                return LoginResult(False, "타임아웃이 발생했습니다.", page.url)
+            except Exception as exc:  # noqa: BLE001
+                return LoginResult(False, f"오류 발생: {exc}", page.url)
+            finally:
+                context.close()
+                browser.close()
+
     def login_and_run_completion_workflow(
         self,
         check_interval_minutes: int = 10,
@@ -451,19 +687,38 @@ class EKHNPAutomator:
 
                 # 1) 학습진도율 수료기준 도달 전까지 차시 진행
                 self._log("1단계: 학습하기를 통해 학습진도율을 수료기준까지 올립니다.")
-                learning_page = self._start_learning_from_progress_panel(classroom_page)
+                self._refresh_classroom_page(classroom_page)
+                initial_progress = self._extract_learning_progress_status(classroom_page)
+                if initial_progress.get("incomplete_count", 0) > 0:
+                    self._log("미완료 차시가 존재하여 우선 '미완료 학습하기'로 진입합니다.")
+                    learning_page = self._open_incomplete_lesson_popup(classroom_page)
+                else:
+                    learning_page = self._start_learning_from_progress_panel(classroom_page)
                 if learning_page is None:
                     return LoginResult(False, "학습창을 열지 못해 진도율 단계 시작 실패", classroom_page.url)
 
                 completed_lessons = 0
+                recovery_attempts = 0
                 while completed_lessons < safety_max_lessons:
                     complete_result = self._complete_lesson_steps(learning_page)
                     if not complete_result.success:
+                        if self._is_recoverable_lesson_failure(complete_result.message) and recovery_attempts < 3:
+                            recovery_attempts += 1
+                            self._log(f"진도율 단계 복구 시도: 팝업 재시작 {recovery_attempts}/3")
+                            recovered_page = self._recover_learning_popup(
+                                current_learning_page=learning_page,
+                                classroom_page=classroom_page,
+                                context_pages=page.context.pages,
+                            )
+                            if recovered_page is not None:
+                                learning_page = recovered_page
+                                continue
                         return LoginResult(
                             False,
                             f"진도율 단계 중단: {complete_result.message}",
                             complete_result.current_url,
                         )
+                    recovery_attempts = 0
                     completed_lessons += 1
                     self._log(f"진도율 단계 누적 완료 차시: {completed_lessons}")
                     if not complete_result.next_lesson_clicked:
@@ -483,6 +738,15 @@ class EKHNPAutomator:
                             break
                         extra_result = self._complete_lesson_steps(extra_page)
                         if not extra_result.success:
+                            if self._is_recoverable_lesson_failure(extra_result.message):
+                                self._log("미완료 차시 보완 중 정체 감지: 팝업 재시작 후 재시도합니다.")
+                                recovered_page = self._recover_learning_popup(
+                                    current_learning_page=extra_page,
+                                    classroom_page=classroom_page,
+                                    context_pages=page.context.pages,
+                                )
+                                if recovered_page is not None:
+                                    continue
                             return LoginResult(
                                 False,
                                 f"미완료 차시 보완 실패: {extra_result.message}",
@@ -526,6 +790,15 @@ class EKHNPAutomator:
                             break
                         extra_result = self._complete_lesson_steps(extra_page)
                         if not extra_result.success:
+                            if self._is_recoverable_lesson_failure(extra_result.message):
+                                self._log("응시 조건 보완 중 정체 감지: 팝업 재시작 후 재시도합니다.")
+                                recovered_page = self._recover_learning_popup(
+                                    current_learning_page=extra_page,
+                                    classroom_page=classroom_page,
+                                    context_pages=page.context.pages,
+                                )
+                                if recovered_page is not None:
+                                    continue
                             return LoginResult(
                                 False,
                                 f"응시 조건 보완 실패: {extra_result.message}",
@@ -686,6 +959,7 @@ class EKHNPAutomator:
                 detected_total_lessons: Optional[int] = self._detected_total_lessons
                 if detected_total_lessons:
                     self._log(f"총 차시 수(강의실 학습하기 버튼 기준): {detected_total_lessons}차시")
+                recovery_attempts = 0
 
                 while completed_lessons < safety_max_lessons:
                     if stop_rule in {"auto", "detected_total"} and detected_total_lessons is None:
@@ -719,6 +993,17 @@ class EKHNPAutomator:
 
                     complete_result = self._complete_lesson_steps(lesson_page)
                     if not complete_result.success:
+                        if self._is_recoverable_lesson_failure(complete_result.message) and recovery_attempts < 3:
+                            recovery_attempts += 1
+                            self._log(f"차시 정체 감지: 팝업 재시작 복구 {recovery_attempts}/3")
+                            recovered_page = self._recover_learning_popup(
+                                current_learning_page=lesson_page,
+                                classroom_page=None,
+                                context_pages=page.context.pages,
+                            )
+                            if recovered_page is not None:
+                                lesson_page = recovered_page
+                                continue
                         if completed_lessons > 0:
                             return LoginResult(
                                 False,
@@ -727,6 +1012,7 @@ class EKHNPAutomator:
                             )
                         return complete_result
 
+                    recovery_attempts = 0
                     completed_lessons += 1
                     self._log(f"차시 완료 누적: {completed_lessons}")
 
@@ -1011,13 +1297,13 @@ class EKHNPAutomator:
             return explicit_script_total
 
         scoped_lesson_section_lesson_no_count = stats.get("scopedLessonSectionLessonNoCount")
-        if isinstance(scoped_lesson_section_lesson_no_count, int) and scoped_lesson_section_lesson_no_count > 0:
+        if isinstance(scoped_lesson_section_lesson_no_count, int) and scoped_lesson_section_lesson_no_count >= 2:
             return scoped_lesson_section_lesson_no_count
 
         scoped_lesson_section_numbered_card_count = stats.get("scopedLessonSectionNumberedCardCount")
         if (
             isinstance(scoped_lesson_section_numbered_card_count, int)
-            and scoped_lesson_section_numbered_card_count > 0
+            and scoped_lesson_section_numbered_card_count >= 2
         ):
             return scoped_lesson_section_numbered_card_count
 
@@ -1033,7 +1319,7 @@ class EKHNPAutomator:
             return scoped_lesson_section_button_count_min_positive
 
         scoped_lesson_no_count = stats.get("scopedLessonNoCount")
-        if isinstance(scoped_lesson_no_count, int) and scoped_lesson_no_count > 0:
+        if isinstance(scoped_lesson_no_count, int) and scoped_lesson_no_count >= 2:
             return scoped_lesson_no_count
 
         # 버튼 개수는 1이 자주 과소감지되는 패턴이어서 2 이상일 때만 신뢰합니다.
@@ -1048,7 +1334,7 @@ class EKHNPAutomator:
             isinstance(global_button_count_raw, int)
             and isinstance(global_button_count_adjusted, int)
             and global_button_count_raw >= 2
-            and global_button_count_adjusted >= 1
+            and global_button_count_adjusted >= 2
         ):
             return global_button_count_adjusted
 
@@ -1249,6 +1535,12 @@ class EKHNPAutomator:
             self._log(
                 f"강의실 학습하기 버튼 개수 감지: 총 {self._detected_total_lessons}차시"
             )
+        # 미완료 차시가 있으면 우선 해당 항목으로 진입해 실제 진도율 상승을 우선합니다.
+        incomplete_popup = self._open_incomplete_lesson_popup(page)
+        if incomplete_popup is not None:
+            self._log("미완료 차시 우선 학습창 열기 성공")
+            return incomplete_popup
+
         try:
             page.locator('text=학습진행현황').first.scroll_into_view_if_needed(timeout=1500)
         except Exception:  # noqa: BLE001
@@ -1537,13 +1829,16 @@ class EKHNPAutomator:
             option_count = int(snap.get("option_count", 0))
             current = int(snap.get("current", 0))
             total = int(snap.get("total", 0))
+            source = str(snap.get("source", "dom"))
             if total > 0:
                 total_hint = max(total_hint, total)
-            if text_len >= 40 and option_count >= 2:
+            if text_len >= 40 and option_count >= 2 and source == "dom":
                 dom_readable_count += 1
 
             self._log(
-                f"문항 판독: idx={visited_count} current/total={current}/{total} text_len={text_len} option_count={option_count}"
+                "문항 판독: "
+                f"idx={visited_count} current/total={current}/{total} "
+                f"text_len={text_len} option_count={option_count} source={source}"
             )
 
             if key in visited_keys:
@@ -1569,55 +1864,295 @@ class EKHNPAutomator:
             "total_hint": total_hint,
         }
 
-    def _extract_exam_question_snapshot(self, page: Page) -> Optional[dict[str, int | str]]:
+    def _solve_exam_stream_with_rag(
+        self,
+        exam_page: Page,
+        solver: Any,
+        max_questions: int = 60,
+        top_k: int = 6,
+        confidence_threshold: float = 0.72,
+    ) -> dict[str, Any]:
+        visited_keys: set[str] = set()
+        solved = 0
+        skipped = 0
+
+        self._log(
+            f"종합평가 RAG 자동풀이 시작 (max={max_questions}, top_k={top_k}, conf>={confidence_threshold:.2f})"
+        )
+        for _ in range(max_questions):
+            snap = self._extract_exam_question_snapshot(exam_page)
+            if snap is None:
+                return {"success": False, "message": "문항 텍스트를 읽지 못했습니다.", "solved": solved, "skipped": skipped}
+
+            key = str(snap.get("key", ""))
+            if key in visited_keys:
+                return {"success": True, "message": "이미 본 문항으로 종료", "solved": solved, "skipped": skipped}
+            visited_keys.add(key)
+
+            question = str(snap.get("question_text", "")).strip()
+            full_text = str(snap.get("full_text", "")).strip()
+            source = str(snap.get("source", "dom"))
+            options = [str(x).strip() for x in snap.get("options", []) if str(x).strip()]
+            current = int(snap.get("current", 0))
+            total = int(snap.get("total", 0))
+            if not question:
+                question = full_text
+
+            if len(options) < 2:
+                if source != "ocr":
+                    snap_ocr = self._extract_exam_question_snapshot(exam_page, force_ocr=True)
+                    if snap_ocr:
+                        options = [str(x).strip() for x in snap_ocr.get("options", []) if str(x).strip()]
+                        question = str(snap_ocr.get("question_text", "")).strip() or str(
+                            snap_ocr.get("full_text", "")
+                        ).strip()
+                        source = str(snap_ocr.get("source", source))
+                if len(options) < 2:
+                    return {
+                        "success": False,
+                        "message": f"보기 추출 실패(current/total={current}/{total}, source={source})",
+                        "solved": solved,
+                        "skipped": skipped,
+                    }
+
+            try:
+                decision = solver.solve(question=question, options=options, top_k=top_k)
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "success": False,
+                    "message": f"RAG 풀이 호출 실패: {exc}",
+                    "solved": solved,
+                    "skipped": skipped,
+                }
+            choice = int(getattr(decision, "choice", 0))
+            confidence = float(getattr(decision, "confidence", 0.0))
+            reason = str(getattr(decision, "reason", ""))
+            evidence_ids = list(getattr(decision, "evidence_ids", []))
+            self._log(
+                "RAG 풀이: "
+                f"Q {current}/{total} -> choice={choice}, conf={confidence:.2f}, source={source}, evidence={evidence_ids[:2]}"
+            )
+
+            if choice < 1 or choice > len(options):
+                return {
+                    "success": False,
+                    "message": f"LLM 선택지 번호 비정상: {choice}",
+                    "solved": solved,
+                    "skipped": skipped,
+                }
+            if confidence < confidence_threshold:
+                retry_top_k = min(20, max(int(top_k) + 2, int(top_k * 1.5)))
+                self._log(
+                    "LLM 신뢰도 낮음으로 재질문 1회 시도: "
+                    f"Q {current}/{total} conf={confidence:.2f} -> top_k={retry_top_k}"
+                )
+                try:
+                    retry_decision = solver.solve(question=question, options=options, top_k=retry_top_k)
+                    retry_choice = int(getattr(retry_decision, "choice", 0))
+                    retry_conf = float(getattr(retry_decision, "confidence", 0.0))
+                    retry_reason = str(getattr(retry_decision, "reason", ""))
+                    retry_evidence_ids = list(getattr(retry_decision, "evidence_ids", []))
+                    self._log(
+                        "RAG 재질문 결과: "
+                        f"Q {current}/{total} -> choice={retry_choice}, conf={retry_conf:.2f}, evidence={retry_evidence_ids[:2]}"
+                    )
+                    if retry_choice >= 1 and retry_choice <= len(options) and retry_conf >= confidence:
+                        choice = retry_choice
+                        confidence = retry_conf
+                        reason = retry_reason or reason
+                        evidence_ids = retry_evidence_ids or evidence_ids
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"RAG 재질문 실패: {exc}")
+
+                if confidence < confidence_threshold:
+                    skipped += 1
+                    return {
+                        "success": False,
+                        "message": f"LLM 신뢰도 낮음(conf={confidence:.2f}): {reason}",
+                        "solved": solved,
+                        "skipped": skipped,
+                    }
+
+            if not self._click_exam_option(exam_page, choice):
+                return {
+                    "success": False,
+                    "message": f"선택지 클릭 실패: {choice}",
+                    "solved": solved,
+                    "skipped": skipped,
+                }
+            solved += 1
+
+            if total > 0 and current >= total:
+                self._click_exam_submit_if_present(exam_page)
+                return {"success": True, "message": "마지막 문항 제출 완료", "solved": solved, "skipped": skipped}
+
+            if not self._click_exam_next(exam_page):
+                self._click_exam_submit_if_present(exam_page)
+                return {"success": True, "message": "다음 버튼 없음, 제출 시도 후 종료", "solved": solved, "skipped": skipped}
+
+            if not self._wait_exam_question_change(exam_page, key):
+                self._click_exam_submit_if_present(exam_page)
+                return {"success": True, "message": "문항 변화 없음, 제출 시도 후 종료", "solved": solved, "skipped": skipped}
+
+        return {"success": False, "message": "문항 상한 도달", "solved": solved, "skipped": skipped}
+
+    @staticmethod
+    def _parse_exam_text_payload(raw_text: str) -> Optional[dict[str, Any]]:
+        normalized = re.sub(r"\s+", " ", raw_text).strip()
+        if len(normalized) < 20:
+            return None
+
+        line_options: list[str] = []
+        for ln in raw_text.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if re.match(r"^(?:[1-5]|[A-Ea-e]|[가-마])\s*[\.\)]\s*.+$", s):
+                cleaned = re.sub(r"^(?:[1-5]|[A-Ea-e]|[가-마])\s*[\.\)]\s*", "", s)
+                line_options.append(cleaned.strip())
+            elif re.match(r"^[①②③④⑤]\s*.+$", s):
+                cleaned = re.sub(r"^[①②③④⑤]\s*", "", s)
+                line_options.append(cleaned.strip())
+            elif re.match(r"^\[(?:[1-5])\]\s*.+$", s):
+                cleaned = re.sub(r"^\[(?:[1-5])\]\s*", "", s)
+                line_options.append(cleaned.strip())
+
+        options = [x for x in line_options if x]
+        option_count = len(options)
+
+        cur = 0
+        tot = 0
+        ratio_match = re.search(r"(\d{1,3})\s*/\s*(\d{1,3})", raw_text)
+        if ratio_match:
+            try:
+                cur = int(ratio_match.group(1))
+                tot = int(ratio_match.group(2))
+            except ValueError:
+                cur = 0
+                tot = 0
+        if cur == 0:
+            cur_match = re.search(r"(?:문항|문제)\s*(\d{1,3})", raw_text)
+            if cur_match:
+                try:
+                    cur = int(cur_match.group(1))
+                except ValueError:
+                    cur = 0
+
+        question_text = normalized
+        if options:
+            split_pat = r"(?:[1-5]|[A-Ea-e]|[가-마])\s*[\.\)]\s+|[①②③④⑤]\s+|\[(?:[1-5])\]\s+"
+            q_part = re.split(split_pat, normalized, maxsplit=1)[0].strip()
+            if q_part:
+                question_text = q_part
+
+        return {
+            "full_text": normalized,
+            "text_len": len(normalized),
+            "current": cur,
+            "total": tot,
+            "question_text": question_text,
+            "options": options,
+            "option_count": option_count,
+        }
+
+    @staticmethod
+    def _score_exam_snapshot(payload: dict[str, Any]) -> int:
+        return (
+            int(payload.get("option_count", 0)) * 1000
+            + min(int(payload.get("text_len", 0)), 900)
+            + (80 if int(payload.get("current", 0)) > 0 else 0)
+            + (60 if int(payload.get("total", 0)) > 0 else 0)
+        )
+
+    def _ensure_tesseract(self) -> bool:
+        if self._tesseract_path is None:
+            self._tesseract_path = shutil.which("tesseract") or ""
+        if not self._tesseract_path and not self._ocr_unavailable_logged:
+            self._ocr_unavailable_logged = True
+            self._log("OCR 폴백 비활성: tesseract 실행 파일을 찾지 못했습니다.")
+        return bool(self._tesseract_path)
+
+    def _ocr_text_from_scope(self, scope: Any) -> str:
+        if not self._ensure_tesseract():
+            return ""
+
+        img_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                img_path = tmp.name
+            scope.locator("body").first.screenshot(path=img_path, timeout=4500)
+
+            cmd = [str(self._tesseract_path), img_path, "stdout", "-l", "kor+eng", "--psm", "6"]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout
+
+            fallback_cmd = [str(self._tesseract_path), img_path, "stdout", "--psm", "6"]
+            fallback_proc = subprocess.run(
+                fallback_cmd, capture_output=True, text=True, timeout=15, check=False
+            )
+            if fallback_proc.returncode == 0:
+                return fallback_proc.stdout or ""
+        except Exception:  # noqa: BLE001
+            return ""
+        finally:
+            if img_path:
+                try:
+                    os.remove(img_path)
+                except Exception:  # noqa: BLE001
+                    pass
+        return ""
+
+    def _extract_exam_question_snapshot(self, page: Page, force_ocr: bool = False) -> Optional[dict[str, Any]]:
         scopes: list[Any] = [page] + list(page.frames)
+        best_snapshot: Optional[dict[str, Any]] = None
+        best_score = -1
+
         for scope in scopes:
+            body_text = ""
             try:
                 body_text = scope.locator("body").inner_text(timeout=2000)
             except Exception:  # noqa: BLE001
+                body_text = ""
+
+            parsed_dom = self._parse_exam_text_payload(body_text) if body_text else None
+            picked = parsed_dom
+            source = "dom"
+
+            needs_ocr = force_ocr or picked is None or int(picked.get("option_count", 0)) < 2
+            if needs_ocr:
+                ocr_text = self._ocr_text_from_scope(scope)
+                parsed_ocr = self._parse_exam_text_payload(ocr_text) if ocr_text else None
+                if parsed_ocr is not None and (
+                    picked is None or self._score_exam_snapshot(parsed_ocr) > self._score_exam_snapshot(picked)
+                ):
+                    picked = parsed_ocr
+                    source = "ocr"
+
+            if picked is None:
                 continue
 
-            normalized = re.sub(r"\s+", " ", body_text).strip()
-            if len(normalized) < 20:
-                continue
-
-            options_by_lines = re.findall(
-                r"(?m)^\s*(?:[1-5]|[A-Ea-e]|[가-마])\s*[\.\)]\s*.+$",
-                body_text,
-            )
-            options_by_symbols = re.findall(r"[①②③④⑤]", body_text)
-            option_count = max(len(options_by_lines), len(set(options_by_symbols)))
-
-            cur = 0
-            tot = 0
-            ratio_match = re.search(r"(\d{1,3})\s*/\s*(\d{1,3})", body_text)
-            if ratio_match:
-                try:
-                    cur = int(ratio_match.group(1))
-                    tot = int(ratio_match.group(2))
-                except ValueError:
-                    cur = 0
-                    tot = 0
-            if cur == 0:
-                cur_match = re.search(r"(?:문항|문제)\s*(\d{1,3})", body_text)
-                if cur_match:
-                    try:
-                        cur = int(cur_match.group(1))
-                    except ValueError:
-                        cur = 0
-
-            key_source = re.sub(r"[^0-9A-Za-z가-힣]+", "", normalized)[:240]
+            key_source = re.sub(r"[^0-9A-Za-z가-힣]+", "", str(picked.get("full_text", "")))[:240]
             if not key_source:
                 continue
 
-            return {
+            snapshot = {
                 "key": key_source,
-                "text_len": len(normalized),
-                "option_count": option_count,
-                "current": cur,
-                "total": tot,
+                "text_len": int(picked.get("text_len", 0)),
+                "option_count": int(picked.get("option_count", 0)),
+                "current": int(picked.get("current", 0)),
+                "total": int(picked.get("total", 0)),
+                "question_text": str(picked.get("question_text", "")),
+                "options": list(picked.get("options", [])),
+                "full_text": str(picked.get("full_text", "")),
+                "source": source,
             }
-        return None
+            score = self._score_exam_snapshot(snapshot)
+            if score > best_score:
+                best_snapshot = snapshot
+                best_score = score
+
+        return best_snapshot
 
     def _click_exam_next(self, page: Page) -> bool:
         selectors = [
@@ -1660,6 +2195,80 @@ class EKHNPAutomator:
                 return True
         except Exception:  # noqa: BLE001
             pass
+        return False
+
+    def _click_exam_option(self, page: Page, choice: int) -> bool:
+        if choice < 1:
+            return False
+        scopes: list[Any] = [page] + list(page.frames)
+        for scope in scopes:
+            try:
+                radios = scope.locator('input[type="radio"]')
+                cnt = radios.count()
+                if cnt >= choice:
+                    target = radios.nth(choice - 1)
+                    if target.is_visible():
+                        target.check(force=True)
+                        page.wait_for_timeout(300)
+                        return True
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 라디오가 없거나 숨김 처리일 때 텍스트 라벨로 클릭 시도
+        choice_tokens = {
+            1: ["①", "1.", "1)", "1번"],
+            2: ["②", "2.", "2)", "2번"],
+            3: ["③", "3.", "3)", "3번"],
+            4: ["④", "4.", "4)", "4번"],
+            5: ["⑤", "5.", "5)", "5번"],
+        }.get(choice, [f"{choice}.", f"{choice})"])
+
+        try:
+            clicked = page.evaluate(
+                """
+                ({ tokens }) => {
+                  const normalize = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
+                  const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                  };
+                  const cands = Array.from(document.querySelectorAll('label,li,td,div,span,a,button'));
+                  for (const el of cands) {
+                    if (!isVisible(el)) continue;
+                    const txt = normalize(el.textContent || el.value || '');
+                    if (!txt || txt.length > 220) continue;
+                    if (tokens.some((t) => txt.startsWith(t) || txt.includes(` ${t} `))) {
+                      el.click();
+                      return true;
+                    }
+                  }
+                  return false;
+                }
+                """,
+                {"tokens": choice_tokens},
+            )
+            if clicked:
+                page.wait_for_timeout(300)
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _click_exam_submit_if_present(self, page: Page) -> bool:
+        selectors = [
+            'button:has-text("제출")',
+            'a:has-text("제출")',
+            'input[value*="제출"]',
+            'button:has-text("완료")',
+            'a:has-text("완료")',
+            'button:has-text("채점")',
+            'a:has-text("채점")',
+        ]
+        scopes: list[Any] = [page] + list(page.frames)
+        for scope in scopes:
+            if self._click_first_visible(scope, selectors, max_items=12):
+                page.wait_for_timeout(1000)
+                return True
         return False
 
     def _wait_exam_question_change(self, page: Page, prev_key: str, timeout_ms: int = 12000) -> bool:
@@ -2047,6 +2656,7 @@ class EKHNPAutomator:
         candidate_page = page
         max_clicks = 120
         step_wait_ms = 8000
+        missing_progress_after_next = 0
 
         for _ in range(max_clicks):
             progress = self._wait_for_step_progress(candidate_page, wait_ms=12000)
@@ -2069,6 +2679,7 @@ class EKHNPAutomator:
                 return LoginResult(False, "현재/전체 단계 표시를 찾지 못했습니다.", candidate_page.url)
 
             current_step, total_step = progress
+            missing_progress_after_next = 0
             self._log(f"차시 단계 진행: {current_step}/{total_step}")
 
             blue_ready = self._wait_until_step_blue(candidate_page, current_step, timeout_ms=240000)
@@ -2091,11 +2702,18 @@ class EKHNPAutomator:
                 )
             if current_step >= total_step:
                 all_blue = self._wait_all_steps_blue(candidate_page, total_step, timeout_ms=180000)
-                next_clicked = False
-                if all_blue:
-                    next_clicked = self._click_final_next_if_available(candidate_page)
-                else:
+                if not all_blue:
                     self._log("모든 단계 파란색 완료 확인 실패 (화면 상태 점검 필요)")
+                    # 빨간 단계가 남아있으면 해당 단계를 먼저 재생합니다.
+                    recovered = self._recover_red_step(candidate_page)
+                    if recovered:
+                        self._log("빨간 단계를 우선 재생하기 위해 해당 단계로 이동합니다.")
+                        candidate_page.wait_for_timeout(1500)
+                        continue
+                # 파란색 집계가 흔들려도 실제 완료 반영을 위해 마지막 Next는 항상 시도합니다.
+                next_clicked = self._click_final_next_if_available(candidate_page)
+                if not next_clicked:
+                    next_clicked = self._click_next_button(candidate_page)
                 moved = self._wait_next_lesson_loaded(candidate_page, current_step, total_step) if next_clicked else False
                 return LoginResult(
                     True,
@@ -2142,6 +2760,15 @@ class EKHNPAutomator:
                                 candidate_page.url,
                                 next_lesson_clicked=False,
                             )
+                        missing_progress_after_next += 1
+                        if missing_progress_after_next <= 3:
+                            self._log(
+                                "다음 클릭 후 단계정보 미판독: "
+                                f"{missing_progress_after_next}/3 재시도"
+                            )
+                            candidate_page.wait_for_timeout(6000)
+                            continue
+                        self._dump_player_debug(candidate_page, "progress_lost_after_next")
                         return LoginResult(False, "다음 클릭 후 단계 정보를 읽지 못했습니다.", candidate_page.url)
                 if check[0] == current_step and check[1] == total_step:
                     self._log("단계 증가가 없어 추가 대기/복구 후 재시도를 진행합니다.")
@@ -2621,13 +3248,18 @@ class EKHNPAutomator:
 
     def _wait_login_form_ready(self, page: Page) -> bool:
         selector = '#j_userId, input[name="j_userId"], input[placeholder*="사번 또는 아이디"]'
-        timeout_ms = min(self.settings.timeout_ms, 70000)
+        # 로그인 문서가 늦게 interactive 상태로 전환되는 케이스가 있어 하한 대기시간을 확보합니다.
+        timeout_ms = min(max(self.settings.timeout_ms, 90000), 180000)
         ticks = max(1, timeout_ms // 500)
 
         for _ in range(ticks):
             try:
+                ready_state = page.evaluate("document.readyState")
+                if ready_state not in {"interactive", "complete"}:
+                    page.wait_for_timeout(500)
+                    continue
                 loc = page.locator(selector).first
-                if loc.count() > 0 and loc.is_visible():
+                if loc.count() > 0 and (loc.is_visible() or loc.is_enabled()):
                     return True
             except Exception:  # noqa: BLE001
                 pass
@@ -2639,6 +3271,69 @@ class EKHNPAutomator:
             return True
         except PlaywrightTimeoutError:
             return False
+
+    @staticmethod
+    def _is_recoverable_lesson_failure(message: str) -> bool:
+        msg = message or ""
+        keywords = [
+            "파란색 완료 상태로 확인되지 않았습니다",
+            "다음 클릭 후 단계 정보를 읽지 못했습니다",
+            "다음 클릭 후 단계가 증가하지 않았습니다",
+            "현재/전체 단계 표시를 찾지 못했습니다",
+        ]
+        return any(k in msg for k in keywords)
+
+    @staticmethod
+    def _find_classroom_page(pages: list[Page]) -> Optional[Page]:
+        for p in reversed(pages):
+            try:
+                if p.is_closed():
+                    continue
+                if "/usr/classroom/main.do" in p.url:
+                    return p
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    def _recover_learning_popup(
+        self,
+        current_learning_page: Optional[Page],
+        classroom_page: Optional[Page],
+        context_pages: list[Page],
+    ) -> Optional[Page]:
+        if current_learning_page is not None:
+            try:
+                if not current_learning_page.is_closed():
+                    current_learning_page.close()
+                    self._log("정체된 학습 팝업을 종료했습니다.")
+            except Exception:  # noqa: BLE001
+                pass
+
+        target_classroom = classroom_page
+        if target_classroom is not None:
+            try:
+                if target_classroom.is_closed():
+                    target_classroom = None
+            except Exception:  # noqa: BLE001
+                target_classroom = None
+        if target_classroom is None:
+            target_classroom = self._find_classroom_page(context_pages)
+        if target_classroom is None:
+            self._log("복구 실패: 강의실 페이지를 찾지 못했습니다.")
+            return None
+
+        try:
+            target_classroom.bring_to_front()
+        except Exception:  # noqa: BLE001
+            pass
+
+        self._refresh_classroom_page(target_classroom)
+        recovered_page = self._start_learning_from_progress_panel(target_classroom)
+        if recovered_page is None:
+            self._log("복구 실패: 강의실에서 학습창 재오픈을 못했습니다.")
+            return None
+        self._log("복구 성공: 이어 학습 팝업을 다시 열었습니다.")
+        return recovered_page
 
     @staticmethod
     def _click_first_visible(page: Any, selectors: list[str], max_items: int = 8) -> bool:

@@ -1,42 +1,129 @@
 # e-KHNP Automation - Next Steps
 
-Last updated: 2026-03-09
+Last updated: 2026-03-10
 
-## Done
-- Login automation works.
-- Navigate to `My학습포털 > 나의 학습현황` via click flow (no direct URL goto fallback).
-- Open first course from course list.
-- Click the bottom `학습하기` inside `학습진행현황`.
-- Learning popup open confirmed: `https://www.e-khnp.com/learning/simple/popup.do`.
+## 현재 스냅샷
+- 핵심 자동화(로그인, 강의실 진입, 차시 처리, 수료표 파싱)까지는 구현됨.
+- 종합평가는 팝업/문항 선택자 안정화와 실세션 E2E 검증이 남아있음.
+- 로컬 LLM(RAG, Ollama) 코드는 연결되었고 실제 문제풀이 정확도 검증이 필요함.
+- 원격 실행(서버화) 및 동시 5명 제한은 설계 단계, 구현 시작 전.
+- 2026-03-10 실측 현황:
+  - 학습진도율 100%
+  - 미완료 0개
+  - 종합평가 응시는 LLM 준비 대기(현재 Ollama 미구동)
 
-## In Progress
-- Auto-complete lesson steps in popup:
-  - Read dynamic step text like `01/06`, `03/20`, `01/01`.
-  - Click `다음` with ~5s delay.
-  - If early click causes red step, click red step to recover and continue.
+## 마일스톤 (업데이트)
+- M1 프로젝트 골격: 100% 완료
+- M2 로그인/포털 이동 자동화: 98% 완료
+- M3 강의실 진입/학습차시 탐색: 96% 완료
+- M4 학습 재생/차시 완료 루프: 94% 완료
+- M5 수료 순서 자동화(진도→시험→시간): 88% 진행중
+- M6 종합평가 자동화 안정화: 74% 진행중
+- M7 LLM(RAG) 기반 시험풀이 고도화: 68% 진행중
+- M8 원격 실행 서버화(FastAPI+Worker): 25% 신규
+- M9 동시성 제어(최대 5명) + 대기열: 20% 신규
+- M10 운영(로그/모니터링/복구): 18% 진행중
 
-Current blocker:
-- Player UI is split across popup page + iframe(s).
-- Step text and next button are not always detected from same scope.
+## 완료된 작업
+- 로그인, `My학습포털 > 나의 학습현황` 이동.
+- 첫 과목 강의실 진입 및 학습창 열기.
+- 긴 페이지에서 학습 버튼/차시 탐색 로직 보강.
+- `학습 차시` 중심 총차시/미완료 판독 강화.
+- 학습종료 안내 문구(`학습이 종료되었습니다` 계열) 감지.
+- 수료표 파싱:
+  - 학습진도율 기준/실적 판독
+  - 학습시간 기준/실적 판독 및 부족분 계산
+- 종합평가 응시 제한 팝업(`학습 진도율 80 이상`) 감지/해제.
+- `미완료` 우선 보완 흐름 반영.
+- Streamlit 기능 추가:
+  - 종합평가 탐침
+  - 수료 순서 자동 실행
+  - RAG 인덱스 생성
+  - 종합평가 LLM 풀이(RAG)
+- 로컬 RAG 파일 추가:
+  - `rag_index.py` (PDF/TXT/MD 인덱싱)
+  - `rag_solver.py` (Ollama 기반 답안 추론)
+- 종합평가 안정화 1차 반영:
+  - 문항 스냅샷 추출을 다중 스코프 평가 방식으로 개선(최적 후보 선택)
+  - 보기 추출 실패 시 OCR(tesseract) 폴백 추가
+  - LLM 저신뢰(confidence 미달) 시 재질문 1회 후 판단 로직 추가
+- 실세션 게이트 검증 완료:
+  - 로그인 → 학습현황 → 강의실 진입 성공
+  - 학습진도율 37% 판독
+  - 종합평가 80% 게이트 차단 동작 확인
+- 학습 정체 복구 로직 추가 및 실검증:
+  - `all_blue` 실패 시 빨간 단계 탐지/우선 진입
+  - 장시간 정체 시 팝업 종료 → 강의실 복귀 → `미완료 학습하기` 재진입
+  - `미완료 우선 진입`을 기본 학습 시작 경로에 반영
+  - 실측 변화: 학습진도율 61% → 100%, 미완료 6 → 0
+  - `all_blue` 실패 시에도 마지막 `Next` 강행 시도
+- 장시간 러너 실운영 검증:
+  - 80% 목표를 넘어 최종 100%/미완료 0 도달
+  - LLM 선조건(`require_llm_before_exam`)이 켜진 상태에서 Ollama 미구동이면 응시 보류됨 확인
+  - 상태 리포트 파일(`logs/overnight_status_live.json`) 기준으로 `paused_llm_required` 기록
 
-## Next Actions
-1. Detect step progress from popup frames reliably.
-2. Bind `다음` click to the correct popup frame/button region.
-3. Re-run full flow and verify finish condition `current == total`.
-4. Add final success log and screenshot when lesson completes.
+## 진행중 작업
+- Ollama 구동 및 모델 준비 후 종합평가 LLM 응시 1회 실행.
+- 종합평가 `응시하기 click` 선택자 실세션 안정화.
+- 시험 문항 추출/선택지 클릭 케이스 보강.
+- 1차시 재생 유지 + 10분 간격 강의실 새로고침 체크 정밀화.
 
-## Deferred (Server/Remote Access)
-- Goal: no local install for users, access by URL.
-- Approach chosen: Cloudflare Tunnel (Option A).
-- Status: deferred for later.
+## 우선순위 실행 순서 (지금부터)
+1. Ollama 실행 + 모델 준비 + RAG 인덱스 점검.
+2. 종합평가 LLM 자동 응시 1회 실행.
+3. 응시 결과(점수/합격여부) 반영 확인.
+4. 학습시간 부족 시 1차시 유지 + 10분 주기 체크로 수료시간 충족.
+5. `응시하기 click` 선택자 잔여 케이스 튜닝.
+6. 서버화 착수(FastAPI + Redis 큐 + 동시 5명 semaphore).
 
-Planned steps:
-1. Run Streamlit on Mac mini (`127.0.0.1:8501`).
-2. Install `cloudflared` and open temporary URL first.
-3. Move to fixed domain tunnel later (optional).
-4. Add auto-start for Streamlit + tunnel.
-5. Decide minimal access control policy (or open access if intentionally public).
+## 추가할 해야할 것 (신규 반영)
+1. 종합평가 페이지 실제 문제 난이도/유형 샘플 1회 수집.
+2. 시험 문제 텍스트 추출 실패 시 이미지 OCR 폴백 경로 추가.
+3. LLM 저신뢰 답변(confidence 미달) 시:
+   - 재질문 1회
+   - 그래도 미달이면 수동 확인 대기
+4. RAG 문서셋 정리:
+   - 원안법/사내자료/기출 유사문항 우선 인덱싱
+   - 청크 길이와 중복 제거 튜닝
+5. 최종 완료판정 룰 고정:
+   - 학습진도율 수료기준 충족
+   - `미완료` 0개
+   - 시험평가 기준점수 충족
+   - 학습시간 기준 충족
+6. 강의 팝업은 유지하고 강의실만 주기 새로고침하는 분리 로직 최종 검증.
+
+## 원격 서비스 마일스톤 (동시 5명 제한)
+- 목표: 외부(휴대폰/사외PC)에서 요청, 실행은 맥미니/서버에서만 처리.
+- 구조:
+  - Web UI(작업 요청/상태 조회)
+  - API(FastAPI)
+  - Queue(Redis)
+  - Worker(Playwright + optional RAG)
+  - Job log/status 저장소
+- 동시성 정책:
+  - 실행 슬롯 5개(semaphore=5)
+  - 초과 요청은 대기열
+  - 대기순번/예상대기시간 표시
+- 계정정보 정책:
+  - 저장 금지(요청 메모리에서만 사용)
+  - 로그 마스킹
+  - 작업 종료 즉시 폐기
+
+## 원격 서비스 TODO
+1. `job` 스키마 확정 (`job_id`, status, queue_pos, started_at, finished_at, summary, error_code).
+2. Redis 큐 + worker semaphore(5) 구현.
+3. 작업 제출 API + 상태/로그 스트리밍 API 구현.
+4. 작업 취소/재시도 API 구현.
+5. 최소 인증(접근 토큰) + 요청 레이트 제한.
+6. 배포 방식 결정:
+   - 단일 맥미니 Docker Compose
+   - 또는 Linux 서버 이전
+7. 운영 대시보드:
+   - 현재 실행 수
+   - 대기열 길이
+   - 평균 처리시간
+   - 실패율
 
 ## Debug Artifacts
 - Folder: `artifacts/player_debug/`
-- Used to inspect popup/page/frame text and screenshots on failure.
+- Purpose: popup/page/frame text/screenshot inspection on failures.
