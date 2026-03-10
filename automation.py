@@ -40,6 +40,7 @@ class EKHNPAutomator:
         self._tesseract_path: Optional[str] = None
         self._ocr_unavailable_logged: bool = False
         self._last_opened_course_title: str = ""
+        self._deferred_exam_course_keys: set[str] = set()
         self._answer_bank_path = Path(getattr(self.settings, "exam_answer_bank_path", "rag/exam_answer_bank.json"))
         self._answer_bank_items: dict[str, dict[str, Any]] = {}
         self._answer_bank_qnorm_index: dict[str, list[dict[str, Any]]] = {}
@@ -164,6 +165,59 @@ class EKHNPAutomator:
     def _log(self, message: str) -> None:
         if self.log_fn:
             self.log_fn(message)
+
+    @staticmethod
+    def _course_title_key(title: str) -> str:
+        return re.sub(r"\s+", " ", str(title or "").strip()).lower()
+
+    def _mark_current_course_exam_deferred(self, reason: str) -> None:
+        title = str(self._last_opened_course_title or "").strip()
+        if not title:
+            title = "제목 확인 실패 과정"
+        key = self._course_title_key(title)
+        if key:
+            self._deferred_exam_course_keys.add(key)
+        self._log(f"과정 우회 등록: {title} / {reason}")
+
+    def _maybe_skip_course_on_low_exam_attempts(
+        self,
+        classroom_page: Page,
+        *,
+        timefill_interval_minutes: int = 10,
+        timefill_check_limit: int = 24,
+    ) -> Optional[LoginResult]:
+        threshold = max(0, int(getattr(self.settings, "exam_skip_course_remaining_threshold", 2)))
+        if threshold <= 0:
+            return None
+
+        status = self._extract_exam_attempt_status(classroom_page)
+        attempted = int(status.get("attempted", 0))
+        max_attempt = int(status.get("max_attempt", 0))
+        remaining = int(status.get("remaining", 0))
+        if max_attempt <= 0:
+            return None
+        if remaining > threshold:
+            return None
+
+        self._log(
+            "저잔여 응시 우회 조건 감지: "
+            f"used={attempted}/{max_attempt}, remaining={remaining}, threshold={threshold}"
+        )
+        precheck = self._ensure_time_requirement_before_course_skip(
+            classroom_page=classroom_page,
+            default_interval_minutes=timefill_interval_minutes,
+            check_limit=timefill_check_limit,
+        )
+        if precheck is not None:
+            return precheck
+
+        title = str(self._last_opened_course_title or "").strip() or "현재 과정"
+        reason = (
+            f"종합평가 잔여 응시 {remaining}회(used={attempted}/{max_attempt})로 "
+            f"임계치 {threshold}회 이하입니다. 다음 강좌로 우회합니다."
+        )
+        self._mark_current_course_exam_deferred(reason)
+        return LoginResult(True, f"과정 우회: {title} / {reason}", classroom_page.url)
 
     def login(self) -> LoginResult:
         if not self.settings.user_id or not self.settings.user_password:
@@ -719,7 +773,12 @@ class EKHNPAutomator:
                 retry_requires_answer_index = bool(
                     getattr(self.settings, "exam_retry_requires_answer_index", True)
                 )
+                retry_no_improve_limit = max(
+                    0, min(4, int(getattr(self.settings, "exam_retry_no_improve_limit", 2)))
+                )
                 retry_round = 0
+                last_retry_score: Optional[float] = None
+                no_improve_streak = 0
 
                 while True:
                     solve_result = self._auto_solve_exam_with_rag(
@@ -750,6 +809,38 @@ class EKHNPAutomator:
                     if self._is_course_marked_completed_in_status(page, self._last_opened_course_title):
                         self._log(f"수료표(발급)에서 과정 완료 확인: {self._last_opened_course_title}")
                         return solve_result
+
+                    retry_reason = str(state.get("reason", "")).strip()
+                    if retry_reason:
+                        self._log(f"종합평가 재응시 사유: {retry_reason}")
+                    else:
+                        self._log("종합평가 재응시 사유: 수료 상태 미완료(상세 사유 없음)")
+
+                    current_score = self._extract_exam_score_from_message(retry_reason)
+                    if current_score is not None:
+                        if last_retry_score is None:
+                            self._log(f"종합평가 점수 추적 시작: score={current_score:.1f}")
+                        elif current_score > (last_retry_score + 0.01):
+                            no_improve_streak = 0
+                            self._log(
+                                f"종합평가 점수 개선: prev={last_retry_score:.1f} -> now={current_score:.1f}"
+                            )
+                        else:
+                            no_improve_streak += 1
+                            self._log(
+                                "종합평가 점수 비개선: "
+                                f"prev={last_retry_score:.1f}, now={current_score:.1f}, "
+                                f"streak={no_improve_streak}/{retry_no_improve_limit}"
+                            )
+                        last_retry_score = current_score
+                    if retry_no_improve_limit > 0 and no_improve_streak >= retry_no_improve_limit:
+                        return LoginResult(
+                            False,
+                            "종합평가 점수 비개선이 연속 감지되어 자동 재응시를 중단합니다. "
+                            f"(streak={no_improve_streak}/{retry_no_improve_limit}) / {retry_reason}",
+                            classroom_page.url,
+                        )
+
                     if retry_round >= max_exam_retries:
                         return LoginResult(
                             False,
@@ -799,10 +890,12 @@ class EKHNPAutomator:
         safety_max_lessons: int = 80,
     ) -> LoginResult:
         max_courses = max(1, min(40, int(self.settings.completion_max_courses)))
+        handled_courses = 0
         completed_courses = 0
+        skipped_courses = 0
         last_url = ""
 
-        while completed_courses < max_courses:
+        while handled_courses < max_courses:
             single = self._login_and_run_completion_workflow_single(
                 check_interval_minutes=check_interval_minutes,
                 max_timefill_checks=max_timefill_checks,
@@ -810,18 +903,27 @@ class EKHNPAutomator:
             )
             last_url = single.current_url
             if not single.success:
-                if completed_courses > 0 and "수강 가능한 과정의 '학습하기/이어 학습하기' 버튼을 찾지 못했습니다." in single.message:
+                if handled_courses > 0 and "수강 가능한 과정의 '학습하기/이어 학습하기' 버튼을 찾지 못했습니다." in single.message:
                     return LoginResult(
                         True,
-                        f"모든 수강 가능 과정 처리 완료: {completed_courses}개 과정",
+                        f"모든 수강 가능 과정 처리 완료: 처리 {handled_courses}개 (수료 {completed_courses}, 우회 {skipped_courses})",
                         last_url,
                     )
                 return single
 
-            completed_courses += 1
-            self._log(f"과정 수료 완료 확인: {completed_courses}개")
+            handled_courses += 1
+            if str(single.message).startswith("과정 우회:"):
+                skipped_courses += 1
+                self._log(f"과정 우회 처리 완료: 누적 우회 {skipped_courses}개 / 처리 {handled_courses}개")
+            else:
+                completed_courses += 1
+                self._log(f"과정 수료 완료 확인: 누적 수료 {completed_courses}개 / 처리 {handled_courses}개")
 
-        return LoginResult(False, f"과정 처리 안전 제한({max_courses}) 도달", last_url)
+        return LoginResult(
+            False,
+            f"과정 처리 안전 제한({max_courses}) 도달: 처리 {handled_courses}개 (수료 {completed_courses}, 우회 {skipped_courses})",
+            last_url,
+        )
 
     def _login_and_run_completion_workflow_single(
         self,
@@ -832,7 +934,7 @@ class EKHNPAutomator:
         if not self.settings.user_id or not self.settings.user_password:
             return LoginResult(False, "환경변수에 EKHNP_USER_ID / EKHNP_USER_PASSWORD를 설정하세요.")
 
-        base_timefill_interval_minutes = max(5, min(10, int(check_interval_minutes)))
+        base_timefill_interval_minutes = max(3, min(10, int(check_interval_minutes)))
         if base_timefill_interval_minutes != int(check_interval_minutes):
             self._log(
                 f"학습시간 보충 확인 주기를 {check_interval_minutes}분에서 "
@@ -1025,16 +1127,82 @@ class EKHNPAutomator:
                             classroom_page.url,
                         )
 
-                # 2) 시험평가 (과정별 수료기준이 공란/'-'이면 시험 없음으로 간주)
+                # 2) 잔여 학습시간 보충
+                self._log("2단계: 잔여 학습시간을 수료기준까지 보충합니다.")
+                self._refresh_classroom_page(classroom_page)
+                time_status = self._extract_study_time_status(classroom_page)
+                progress_status = self._extract_learning_progress_status(classroom_page)
+                known_required_seconds = (
+                    int(time_status.get("required_seconds", 0))
+                    if bool(time_status.get("requirement_known", False))
+                    else 0
+                )
+                if not progress_status["progress_ok"] or progress_status["incomplete_count"] > 0:
+                    return LoginResult(
+                        False,
+                        "학습시간 보충 전 학습진도율 기준 미충족(미완료 차시 존재 포함)으로 중단합니다.",
+                        classroom_page.url,
+                    )
+
+                if not self._is_time_requirement_satisfied(
+                    time_status,
+                    required_seconds_floor=known_required_seconds,
+                ):
+                    self._log("학습시간이 부족해 1차시 재생 유지 모드로 진입합니다.")
+                    keepalive_page = self._open_first_lesson_popup_for_timefill(classroom_page)
+                    if keepalive_page is None:
+                        return LoginResult(False, "학습시간 보충용 1차시 학습창을 열지 못했습니다.", classroom_page.url)
+
+                    for idx in range(check_limit):
+                        wait_minutes = self._decide_timefill_check_interval_minutes(
+                            time_status=time_status,
+                            default_minutes=base_timefill_interval_minutes,
+                        )
+                        self._log(
+                            f"학습시간 보충 대기: {idx + 1}/{check_limit} "
+                            f"(다음 확인 {wait_minutes}분 후, 남은시간 "
+                            f"{self._format_seconds(int(time_status.get('shortage_seconds', 0)))} )"
+                        )
+                        keepalive_page.wait_for_timeout(wait_minutes * 60 * 1000)
+                        self._refresh_classroom_page(classroom_page)
+                        time_status = self._extract_study_time_status(classroom_page)
+                        if bool(time_status.get("requirement_known", False)):
+                            known_required_seconds = max(
+                                known_required_seconds,
+                                int(time_status.get("required_seconds", 0)),
+                            )
+                        progress_status = self._extract_learning_progress_status(classroom_page)
+                        if not progress_status["progress_ok"] or progress_status["incomplete_count"] > 0:
+                            return LoginResult(
+                                False,
+                                "학습시간 보충 중 학습진도율 기준 미충족(미완료 차시 존재 포함)으로 중단합니다.",
+                                classroom_page.url,
+                            )
+                        if self._is_time_requirement_satisfied(
+                            time_status,
+                            required_seconds_floor=known_required_seconds,
+                        ):
+                            self._log("학습시간 보충 완료: 수료기준 충족")
+                            break
+                    else:
+                        return LoginResult(
+                            False,
+                            "학습시간 보충 체크 제한 횟수에 도달했습니다. (기준 충족 미확인)",
+                            classroom_page.url,
+                        )
+                else:
+                    self._log("학습시간 수료기준이 이미 충족되어 보충 단계를 생략합니다.")
+
+                # 3) 시험평가 (과정별 수료기준이 공란/'-'이면 시험 없음으로 간주)
                 exam_req = self._extract_exam_requirement_status(classroom_page)
                 should_run_exam = True
                 if bool(exam_req.get("known", False)) and not bool(exam_req.get("has_exam", True)):
                     should_run_exam = False
                     self._log(
-                        f"2단계: 시험평가 수료기준이 공란/(-)으로 확인되어 종합평가를 생략합니다. {exam_req.get('reason', '')}"
+                        f"3단계: 시험평가 수료기준이 공란/(-)으로 확인되어 종합평가를 생략합니다. {exam_req.get('reason', '')}"
                     )
                 else:
-                    self._log("2단계: 종합평가 응시를 진행합니다.")
+                    self._log("3단계: 종합평가 응시를 진행합니다.")
 
                 if should_run_exam:
                     exam_gate = self._extract_learning_progress_status(classroom_page)
@@ -1047,6 +1215,13 @@ class EKHNPAutomator:
                         self._log(f"종합평가 응시 조건 충족: 학습진도율 {exam_gate_percent}%")
                     else:
                         self._log("학습진도율 수치 판독 실패(0%). 응시 버튼 탐색으로 진행합니다.")
+                    skip_course = self._maybe_skip_course_on_low_exam_attempts(
+                        classroom_page=classroom_page,
+                        timefill_interval_minutes=base_timefill_interval_minutes,
+                        timefill_check_limit=check_limit,
+                    )
+                    if skip_course is not None:
+                        return skip_course
                     attempt_guard = self._enforce_exam_attempt_reserve(classroom_page)
                     if attempt_guard is not None:
                         return attempt_guard
@@ -1090,6 +1265,13 @@ class EKHNPAutomator:
                                 f"종합평가 응시 조건 미달: 학습진도율 {exam_gate_percent}% (최소 80% 필요)",
                                 classroom_page.url,
                             )
+                        skip_course = self._maybe_skip_course_on_low_exam_attempts(
+                            classroom_page=classroom_page,
+                            timefill_interval_minutes=base_timefill_interval_minutes,
+                            timefill_check_limit=check_limit,
+                        )
+                        if skip_course is not None:
+                            return skip_course
                         attempt_guard = self._enforce_exam_attempt_reserve(classroom_page)
                         if attempt_guard is not None:
                             return attempt_guard
@@ -1101,7 +1283,12 @@ class EKHNPAutomator:
                     retry_requires_answer_index = bool(
                         getattr(self.settings, "exam_retry_requires_answer_index", True)
                     )
+                    retry_no_improve_limit = max(
+                        0, min(4, int(getattr(self.settings, "exam_retry_no_improve_limit", 2)))
+                    )
                     retry_round = 0
+                    last_retry_score: Optional[float] = None
+                    no_improve_streak = 0
                     while True:
                         solve_exam = self._auto_solve_exam_with_rag(
                             exam_page=exam_page,
@@ -1127,6 +1314,34 @@ class EKHNPAutomator:
                             )
                             break
 
+                        retry_reason = completion_guard.message.strip()
+                        self._log(f"종합평가 재응시 사유: {retry_reason}")
+                        current_score = self._extract_exam_score_from_message(retry_reason)
+                        if current_score is not None:
+                            if last_retry_score is None:
+                                self._log(f"종합평가 점수 추적 시작: score={current_score:.1f}")
+                            elif current_score > (last_retry_score + 0.01):
+                                no_improve_streak = 0
+                                self._log(
+                                    f"종합평가 점수 개선: prev={last_retry_score:.1f} -> now={current_score:.1f}"
+                                )
+                            else:
+                                no_improve_streak += 1
+                                self._log(
+                                    "종합평가 점수 비개선: "
+                                    f"prev={last_retry_score:.1f}, now={current_score:.1f}, "
+                                    f"streak={no_improve_streak}/{retry_no_improve_limit}"
+                                )
+                            last_retry_score = current_score
+
+                        if retry_no_improve_limit > 0 and no_improve_streak >= retry_no_improve_limit:
+                            return LoginResult(
+                                False,
+                                f"{completion_guard.message} / 점수 비개선이 연속 감지되어 자동 재응시를 중단합니다. "
+                                f"(streak={no_improve_streak}/{retry_no_improve_limit})",
+                                classroom_page.url,
+                            )
+
                         if retry_round >= max_exam_retries:
                             return LoginResult(
                                 False,
@@ -1149,6 +1364,13 @@ class EKHNPAutomator:
                                 classroom_page.url,
                             )
 
+                        skip_course = self._maybe_skip_course_on_low_exam_attempts(
+                            classroom_page=classroom_page,
+                            timefill_interval_minutes=base_timefill_interval_minutes,
+                            timefill_check_limit=check_limit,
+                        )
+                        if skip_course is not None:
+                            return skip_course
                         attempt_guard = self._enforce_exam_attempt_reserve(classroom_page)
                         if attempt_guard is not None:
                             return LoginResult(
@@ -1163,63 +1385,14 @@ class EKHNPAutomator:
                         if exam_page is None:
                             return LoginResult(False, "정답지 학습 후 종합평가 재응시 팝업을 찾지 못했습니다.", classroom_page.url)
 
-                # 3) 학습시간 부족 시 1차시 재생 유지 + 10분 간격 체크
+                # 4) 최종 수료 상태 확인
                 self._refresh_classroom_page(classroom_page)
-                time_status = self._extract_study_time_status(classroom_page)
-                progress_status = self._extract_learning_progress_status(classroom_page)
-                if not progress_status["progress_ok"] or progress_status["incomplete_count"] > 0:
-                    return LoginResult(
-                        False,
-                        "시험평가 후 학습진도율 기준 미충족(미완료 차시 존재 포함)으로 중단합니다.",
-                        classroom_page.url,
-                    )
-                if time_status["requirement_known"] and time_status["shortage_seconds"] <= 0:
-                    completion_guard = self._ensure_course_completed(classroom_page)
-                    if completion_guard is not None:
-                        return completion_guard
-                    return LoginResult(
-                        True,
-                        "수료 시나리오 완료: 진도율/시험평가 이후 학습시간도 수료기준 충족",
-                        classroom_page.url,
-                    )
-
-                self._log("3단계: 학습시간이 부족해 1차시 재생 유지 모드로 진입합니다.")
-                keepalive_page = self._open_first_lesson_popup_for_timefill(classroom_page)
-                if keepalive_page is None:
-                    return LoginResult(False, "학습시간 보충용 1차시 학습창을 열지 못했습니다.", classroom_page.url)
-
-                for idx in range(check_limit):
-                    wait_minutes = self._decide_timefill_check_interval_minutes(
-                        time_status=time_status,
-                        default_minutes=base_timefill_interval_minutes,
-                    )
-                    self._log(
-                        f"학습시간 보충 대기: {idx + 1}/{check_limit} "
-                        f"(다음 확인 {wait_minutes}분 후, 남은시간 "
-                        f"{self._format_seconds(int(time_status.get('shortage_seconds', 0)))} )"
-                    )
-                    keepalive_page.wait_for_timeout(wait_minutes * 60 * 1000)
-                    self._refresh_classroom_page(classroom_page)
-                    time_status = self._extract_study_time_status(classroom_page)
-                    progress_status = self._extract_learning_progress_status(classroom_page)
-                    if (
-                        progress_status["progress_ok"]
-                        and progress_status["incomplete_count"] <= 0
-                        and time_status["requirement_known"]
-                        and time_status["shortage_seconds"] <= 0
-                    ):
-                        completion_guard = self._ensure_course_completed(classroom_page)
-                        if completion_guard is not None:
-                            return completion_guard
-                        return LoginResult(
-                            True,
-                            "수료 시나리오 완료: 학습시간 부족분이 충족되었습니다.",
-                            classroom_page.url,
-                        )
-
+                completion_guard = self._ensure_course_completed(classroom_page)
+                if completion_guard is not None:
+                    return completion_guard
                 return LoginResult(
-                    False,
-                    "학습시간 보충 체크 제한 횟수에 도달했습니다. (기준 충족 미확인)",
+                    True,
+                    "수료 시나리오 완료: 진도율→학습시간→시험평가 기준 충족",
                     classroom_page.url,
                 )
             except PlaywrightTimeoutError:
@@ -1853,10 +2026,21 @@ class EKHNPAutomator:
                 """
             )
         if not clicked:
-            return LoginResult(False, "'나의 학습현황' 메뉴 클릭 실패", page.url)
+            self._log("메뉴 클릭 실패: '나의 학습현황' 직접 URL 이동을 시도합니다.")
+            origin_match = re.match(r"^https?://[^/]+", page.url)
+            origin = origin_match.group(0) if origin_match else self.settings.base_url.rstrip("/")
+            direct_url = f"{origin}/usr/member/dash/detail.do"
+            try:
+                page.goto(direct_url, wait_until="domcontentloaded")
+                page.wait_for_timeout(1200)
+            except Exception:  # noqa: BLE001
+                return LoginResult(False, "'나의 학습현황' 메뉴 클릭 실패", page.url)
 
         page.wait_for_load_state("domcontentloaded")
         page.wait_for_timeout(1200)
+        current_url = page.url.lower()
+        if "/usr/member/dash/detail.do" in current_url:
+            return LoginResult(True, "나의 학습현황 페이지 이동 성공(URL 확인)", page.url)
         body_text = page.locator("body").inner_text(timeout=5000)
         if "나의 학습현황" in body_text or "My Learning" in body_text:
             return LoginResult(True, "나의 학습현황 페이지 이동 성공", page.url)
@@ -1912,6 +2096,10 @@ class EKHNPAutomator:
                     break
             if not title:
                 title = f"{idx + 1}번째 과정"
+            title_key = self._course_title_key(title)
+            if title_key and title_key in self._deferred_exam_course_keys:
+                self._log(f"우회 등록 과정 스킵: {title}")
+                continue
             return title, button
         return "", None
 
@@ -2167,7 +2355,7 @@ class EKHNPAutomator:
             () => {
                 const isTargetButton = (el) => {
                   const txt = ((el.textContent || el.value || '').trim());
-                  const compact = txt.replace(/\s+/g, '');
+                  const compact = txt.replace(/\\s+/g, '');
                   return compact === '학습하기' || compact === '이어학습하기';
                 };
 
@@ -2645,14 +2833,28 @@ class EKHNPAutomator:
                 question = full_text
 
             if len(options) < 2:
-                if source != "ocr":
-                    snap_ocr = self._extract_exam_question_snapshot(exam_page, force_ocr=True)
-                    if snap_ocr:
-                        options = [str(x).strip() for x in snap_ocr.get("options", []) if str(x).strip()]
-                        question = str(snap_ocr.get("question_text", "")).strip() or str(
-                            snap_ocr.get("full_text", "")
-                        ).strip()
-                        source = str(snap_ocr.get("source", source))
+                for retry in range(3):
+                    if retry > 0:
+                        exam_page.wait_for_timeout(1200)
+                    snap_retry = self._extract_exam_question_snapshot(exam_page, force_ocr=True)
+                    if snap_retry:
+                        retry_options = [str(x).strip() for x in snap_retry.get("options", []) if str(x).strip()]
+                        if len(retry_options) >= 2:
+                            options = retry_options
+                            question = str(snap_retry.get("question_text", "")).strip() or str(
+                                snap_retry.get("full_text", "")
+                            ).strip()
+                            source = str(snap_retry.get("source", source))
+                    if len(options) < 2:
+                        structured_options = self._extract_exam_options_structured(exam_page)
+                        if len(structured_options) >= 2:
+                            options = structured_options
+                            source = f"{source}+structured"
+                    if len(options) >= 2:
+                        self._log(
+                            f"보기 추출 폴백 성공: retry={retry + 1}, source={source}, option_count={len(options)}"
+                        )
+                        break
                 if len(options) < 2:
                     return {
                         "success": False,
@@ -3143,6 +3345,98 @@ class EKHNPAutomator:
                 best_score = score
 
         return best_snapshot
+
+    def _extract_exam_options_structured(self, page: Page) -> list[str]:
+        scopes: list[Any] = [page] + list(page.frames)
+        best_texts: list[str] = []
+        best_input_count = 0
+
+        for scope in scopes:
+            try:
+                info = scope.evaluate(
+                    """
+                    () => {
+                      const norm = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
+                      const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style && style.display === 'none') return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                      };
+                      const cleanOpt = (txt) => {
+                        let s = norm(txt);
+                        s = s.replace(/^\\d+\\s*[\\.)]\\s*/, '');
+                        s = s.replace(/^([①②③④⑤]|[1-5]|[A-Ea-e]|[가-마])\\s*[\\.)]?\\s*/, '');
+                        return norm(s);
+                      };
+
+                      const radios = Array.from(
+                        document.querySelectorAll('input[name="choiceAnswers"], input[type="radio"], input[type="checkbox"]')
+                      ).filter(isVisible);
+                      const answerAnchors = Array.from(
+                        document.querySelectorAll(
+                          'a.answer-item, li[id^="example-item-"] a, li[class*="example-item"] a, .answer-box li a'
+                        )
+                      ).filter(isVisible);
+
+                      const seen = new Set();
+                      const texts = [];
+                      for (const input of radios) {
+                        let txt = '';
+                        const parentLabel = input.closest('label');
+                        if (parentLabel) txt = norm(parentLabel.innerText || parentLabel.textContent || '');
+                        if (!txt) {
+                          const container = input.closest('li, td, tr, div, p');
+                          if (container) txt = norm(container.innerText || container.textContent || '');
+                        }
+                        txt = cleanOpt(txt);
+                        if (!txt || txt.length < 1) continue;
+                        if (seen.has(txt)) continue;
+                        seen.add(txt);
+                        texts.push(txt);
+                      }
+
+                      for (const anchor of answerAnchors) {
+                        let txt = cleanOpt(anchor.innerText || anchor.textContent || '');
+                        if (!txt) {
+                          const li = anchor.closest('li');
+                          if (li) txt = cleanOpt(li.innerText || li.textContent || '');
+                        }
+                        if (!txt || txt.length < 1) continue;
+                        if (seen.has(txt)) continue;
+                        seen.add(txt);
+                        texts.push(txt);
+                      }
+
+                      return {
+                        optionTexts: texts,
+                        inputCount: Math.max(radios.length, answerAnchors.length),
+                      };
+                    }
+                    """
+                )
+            except Exception:  # noqa: BLE001
+                continue
+
+            if not isinstance(info, dict):
+                continue
+            option_texts = [str(x).strip() for x in info.get("optionTexts", []) if str(x).strip()]
+            input_count = int(info.get("inputCount", 0) or 0)
+
+            if len(option_texts) > len(best_texts):
+                best_texts = option_texts
+                best_input_count = input_count
+            elif len(option_texts) == len(best_texts) and input_count > best_input_count:
+                best_input_count = input_count
+
+        if len(best_texts) >= 2:
+            return best_texts[:5]
+
+        if best_input_count >= 2:
+            return [f"선택지 {idx}" for idx in range(1, min(best_input_count, 5) + 1)]
+
+        return []
 
     @staticmethod
     def _build_exam_snapshot_key(payload: dict[str, Any]) -> str:
@@ -4403,11 +4697,22 @@ class EKHNPAutomator:
             pass
 
         ticks = max(1, timeout_ms // 400)
-        for _ in range(ticks):
+        shell_ready_seen = False
+        for idx in range(ticks):
             try:
                 body = exam_page.locator("body").inner_text(timeout=1200)
-                if len((body or "").strip()) >= 40:
-                    return
+                body_str = (body or "").strip()
+                if len(body_str) >= 40:
+                    parsed = self._parse_exam_text_payload(body_str)
+                    if parsed is not None and int(parsed.get("option_count", 0)) >= 2:
+                        return
+
+                    # 문제 틀(타이머/문항수/제출버튼)만 먼저 보이는 케이스에서
+                    # 선택지 렌더링을 조금 더 기다립니다.
+                    if "답안 제출하기" in body_str and re.search(r"\d{1,3}\s*/\s*\d{1,3}", body_str):
+                        shell_ready_seen = True
+                    if shell_ready_seen and idx >= int(ticks * 0.75):
+                        return
             except Exception:  # noqa: BLE001
                 pass
             exam_page.wait_for_timeout(400)
@@ -4486,7 +4791,7 @@ class EKHNPAutomator:
                         return r.width > 0 && r.height > 0;
                       };
                       const isLessonBtn = (txt, oc, href) => {
-                        const compact = String(txt || '').replace(/\s+/g, '');
+                        const compact = String(txt || '').replace(/\\s+/g, '');
                         if (compact === '학습하기' || compact === '이어학습하기') return true;
                         if (oc.includes('doStudyPopup') || oc.includes('doLearning') || oc.includes('doFirstScript')) return true;
                         if (href.includes('doStudyPopup') || href.includes('doLearning')) return true;
@@ -4539,8 +4844,8 @@ class EKHNPAutomator:
                         return r.width > 0 && r.height > 0;
                       };
                       const isLessonBtn = (txt) => (
-                        String(txt || '').replace(/\s+/g, '') === '학습하기'
-                        || String(txt || '').replace(/\s+/g, '') === '이어학습하기'
+                        String(txt || '').replace(/\\s+/g, '') === '학습하기'
+                        || String(txt || '').replace(/\\s+/g, '') === '이어학습하기'
                       );
                       const cands = Array.from(
                         document.querySelectorAll('a,button,input[type="button"],input[type="submit"],span')
@@ -4846,6 +5151,63 @@ class EKHNPAutomator:
                 return picked
         return None
 
+    def _ensure_time_requirement_before_course_skip(
+        self,
+        classroom_page: Page,
+        *,
+        default_interval_minutes: int,
+        check_limit: int,
+    ) -> Optional[LoginResult]:
+        self._refresh_classroom_page(classroom_page)
+        time_status = self._extract_study_time_status(classroom_page)
+        known_required_seconds = (
+            int(time_status.get("required_seconds", 0))
+            if bool(time_status.get("requirement_known", False))
+            else 0
+        )
+        if self._is_time_requirement_satisfied(
+            time_status=time_status,
+            required_seconds_floor=known_required_seconds,
+        ):
+            return None
+
+        self._log("과정 우회 전 학습시간 미달 감지: 학습시간 보충을 먼저 진행합니다.")
+        keepalive_page = self._open_first_lesson_popup_for_timefill(classroom_page)
+        if keepalive_page is None:
+            return LoginResult(False, "학습시간 보충용 1차시 학습창을 열지 못했습니다.", classroom_page.url)
+
+        limit = max(1, min(int(check_limit), 72))
+        for idx in range(limit):
+            wait_minutes = self._decide_timefill_check_interval_minutes(
+                time_status=time_status,
+                default_minutes=int(default_interval_minutes),
+            )
+            self._log(
+                f"우회 전 학습시간 보충 대기: {idx + 1}/{limit} "
+                f"(다음 확인 {wait_minutes}분 후, 남은시간 "
+                f"{self._format_seconds(int(time_status.get('shortage_seconds', 0)))} )"
+            )
+            keepalive_page.wait_for_timeout(wait_minutes * 60 * 1000)
+            self._refresh_classroom_page(classroom_page)
+            time_status = self._extract_study_time_status(classroom_page)
+            if bool(time_status.get("requirement_known", False)):
+                known_required_seconds = max(
+                    known_required_seconds,
+                    int(time_status.get("required_seconds", 0)),
+                )
+            if self._is_time_requirement_satisfied(
+                time_status=time_status,
+                required_seconds_floor=known_required_seconds,
+            ):
+                self._log("우회 전 학습시간 보충 완료: 수료기준 충족")
+                return None
+
+        return LoginResult(
+            False,
+            "과정 우회 전 학습시간 보충 제한 횟수 내에 수료기준을 충족하지 못했습니다.",
+            classroom_page.url,
+        )
+
     def _extract_study_time_status(self, classroom_page: Page) -> dict[str, int | bool]:
         table_rows = self._extract_completion_table_rows(classroom_page)
         time_row = table_rows.get("학습시간", {})
@@ -4901,7 +5263,7 @@ class EKHNPAutomator:
     def _decide_timefill_check_interval_minutes(
         time_status: dict[str, int | bool], default_minutes: int
     ) -> int:
-        base = max(5, min(10, int(default_minutes)))
+        base = max(3, min(10, int(default_minutes)))
         if not isinstance(time_status, dict):
             return base
         if not bool(time_status.get("requirement_known", False)):
@@ -4914,7 +5276,7 @@ class EKHNPAutomator:
             return base
 
         if shortage <= 0:
-            return 5
+            return 3
 
         ratio = (float(shortage) / float(required)) if required > 0 else 0.0
         if shortage >= 2 * 3600 or ratio >= 0.70:
@@ -4927,7 +5289,31 @@ class EKHNPAutomator:
             return 7
         if shortage >= 300:
             return 6
-        return 5
+        if shortage >= 180:
+            return 5
+        if shortage >= 60:
+            return 4
+        return 3
+
+    @staticmethod
+    def _is_time_requirement_satisfied(
+        time_status: dict[str, int | bool], required_seconds_floor: int = 0
+    ) -> bool:
+        if not isinstance(time_status, dict):
+            return False
+        try:
+            current = max(0, int(time_status.get("current_seconds", 0)))
+            required = max(0, int(time_status.get("required_seconds", 0)))
+            shortage = max(0, int(time_status.get("shortage_seconds", 0)))
+        except Exception:  # noqa: BLE001
+            return False
+
+        if bool(time_status.get("requirement_known", False)):
+            return shortage <= 0
+        floor_required = max(0, int(required_seconds_floor))
+        if floor_required > 0 and current >= floor_required:
+            return True
+        return required > 0 and current >= required
 
     def _ensure_course_completed(self, classroom_page: Page) -> Optional[LoginResult]:
         state = self._extract_course_completion_state(classroom_page)
@@ -5162,6 +5548,24 @@ class EKHNPAutomator:
                 return float(m2.group(1))
             except ValueError:
                 return None
+        return None
+
+    @staticmethod
+    def _extract_exam_score_from_message(message: str) -> Optional[float]:
+        src = (message or "").replace(",", " ")
+        patterns = [
+            r"actual\s*=\s*([0-9]{1,3}(?:\.[0-9]+)?)",
+            r"score\s*=\s*([0-9]{1,3}(?:\.[0-9]+)?)",
+            r"([0-9]{1,3}(?:\.[0-9]+)?)\s*점",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, src, flags=re.IGNORECASE)
+            if not m:
+                continue
+            try:
+                return float(m.group(1))
+            except ValueError:
+                continue
         return None
 
     def _close_post_exam_transient_pages(self, pages: list[Page], keep_pages: list[Page]) -> None:
@@ -5863,8 +6267,18 @@ class EKHNPAutomator:
             if "/login/process.do" in current_url:
                 self._log("로그인 process.do URL 감지, 다음 단계에서 메인 전환을 재시도합니다.")
                 return LoginResult(True, "로그인 성공 추정 (process.do 감지)", page.url)
-            self._log("URL 변경을 감지했습니다.")
-            return LoginResult(True, "로그인 성공 추정 (URL 변경)", page.url)
+            lowered = current_url.lower()
+            login_like_paths = [
+                "/common/login/loginpage.do",
+                "/login/loginpage.do",
+                "/common/login/",
+                "/member/login",
+            ]
+            if any(path in lowered for path in login_like_paths):
+                self._log("URL 변경을 감지했지만 로그인 페이지로 판단되어 성공 판정을 보류합니다.")
+            else:
+                self._log("URL 변경을 감지했습니다.")
+                return LoginResult(True, "로그인 성공 추정 (URL 변경)", page.url)
 
         try:
             page_text = page.locator("body").inner_text(timeout=3000)

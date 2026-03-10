@@ -1,0 +1,9 @@
+tunnel: REPLACE_WITH_TUNNEL_ID
+credentials-file: /Users/REPLACE_WITH_USER/.cloudflared/REPLACE_WITH_TUNNEL_ID.json
+
+ingress:
+  - hostname: app.kwon.work
+    service: http://127.0.0.1:8501
+  - hostname: admin.kwon.work
+    service: http://127.0.0.1:8502
+  - service: http_status:404
