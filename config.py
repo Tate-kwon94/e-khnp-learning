@@ -39,7 +39,7 @@ class Settings:
     app_access_max_attempts: int = int(os.getenv("APP_ACCESS_MAX_ATTEMPTS", "5"))
     app_access_cooldown_sec: int = int(os.getenv("APP_ACCESS_COOLDOWN_SEC", "300"))
     app_access_session_ttl_min: int = int(os.getenv("APP_ACCESS_SESSION_TTL_MIN", "240"))
-    app_worker_count: int = int(os.getenv("APP_WORKER_COUNT", "1"))
+    app_worker_count: int = int(os.getenv("APP_WORKER_COUNT", "5"))
     app_queue_max_pending: int = int(os.getenv("APP_QUEUE_MAX_PENDING", "20"))
     app_queue_max_history: int = int(os.getenv("APP_QUEUE_MAX_HISTORY", "200"))
     app_security_audit_enabled: bool = _env_bool("APP_SECURITY_AUDIT_ENABLED", "true")
@@ -67,6 +67,10 @@ class Settings:
     rag_web_timeout_sec: int = int(os.getenv("RAG_WEB_TIMEOUT_SEC", "8"))
     rag_web_weight: float = float(os.getenv("RAG_WEB_WEIGHT", "0.35"))
     exam_answer_bank_path: str = os.getenv("EXAM_ANSWER_BANK_PATH", "rag/exam_answer_bank.json")
+    exam_deferred_courses_path: str = os.getenv(
+        "EXAM_DEFERRED_COURSES_PATH", ".runtime/deferred_exam_courses.json"
+    )
+    exam_quality_report_dir: str = os.getenv("EXAM_QUALITY_REPORT_DIR", "logs/exam_quality_reports")
     exam_auto_retry_max: int = int(os.getenv("EXAM_AUTO_RETRY_MAX", "2"))
     exam_retry_requires_answer_index: bool = _env_bool("EXAM_RETRY_REQUIRES_ANSWER_INDEX", "true")
     exam_retry_no_improve_limit: int = int(os.getenv("EXAM_RETRY_NO_IMPROVE_LIMIT", "2"))

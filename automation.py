@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -44,12 +45,26 @@ class EKHNPAutomator:
         self._answer_bank_path = Path(getattr(self.settings, "exam_answer_bank_path", "rag/exam_answer_bank.json"))
         self._answer_bank_items: dict[str, dict[str, Any]] = {}
         self._answer_bank_qnorm_index: dict[str, list[dict[str, Any]]] = {}
+        self._answer_bank_qsig_index: dict[str, list[dict[str, Any]]] = {}
+        self._answer_bank_qsig_optset_index: dict[str, list[dict[str, Any]]] = {}
         self._answer_bank_fuzzy_index: list[dict[str, Any]] = []
+        self._deferred_courses_path = Path(
+            getattr(self.settings, "exam_deferred_courses_path", ".runtime/deferred_exam_courses.json")
+        )
+        self._deferred_exam_course_history: dict[str, dict[str, Any]] = {}
+        self._exam_quality_report_dir = Path(
+            getattr(self.settings, "exam_quality_report_dir", "logs/exam_quality_reports")
+        )
+        self._question_evidence_fail_streak: dict[str, dict[str, int]] = {}
+        self._last_exam_solve_payload: dict[str, Any] = {}
         self._load_answer_bank()
+        self._load_deferred_exam_courses()
 
     def _load_answer_bank(self) -> None:
         self._answer_bank_items = {}
         self._answer_bank_qnorm_index = {}
+        self._answer_bank_qsig_index = {}
+        self._answer_bank_qsig_optset_index = {}
         self._answer_bank_fuzzy_index = []
         try:
             if not self._answer_bank_path.exists():
@@ -64,7 +79,59 @@ class EKHNPAutomator:
         except Exception:  # noqa: BLE001
             self._answer_bank_items = {}
             self._answer_bank_qnorm_index = {}
+            self._answer_bank_qsig_index = {}
+            self._answer_bank_qsig_optset_index = {}
             self._answer_bank_fuzzy_index = []
+
+    def _load_deferred_exam_courses(self) -> None:
+        self._deferred_exam_course_keys = set()
+        self._deferred_exam_course_history = {}
+        try:
+            if not self._deferred_courses_path.exists():
+                return
+            raw = json.loads(self._deferred_courses_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return
+
+        items = raw.get("items") if isinstance(raw, dict) else None
+        if not isinstance(items, list):
+            return
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            key = self._course_title_key(str(row.get("title", "")))
+            if not key:
+                key = str(row.get("key", "")).strip().lower()
+            if not key:
+                continue
+            title = str(row.get("title", "")).strip()
+            reason = str(row.get("reason", "")).strip()
+            updated_at = str(row.get("updated_at", "")).strip()
+            payload = {"key": key, "title": title, "reason": reason, "updated_at": updated_at}
+            self._deferred_exam_course_history[key] = payload
+            self._deferred_exam_course_keys.add(key)
+
+    def _save_deferred_exam_courses(self) -> None:
+        try:
+            self._deferred_courses_path.parent.mkdir(parents=True, exist_ok=True)
+            rows = sorted(
+                self._deferred_exam_course_history.values(),
+                key=lambda x: str(x.get("updated_at", "")),
+                reverse=True,
+            )
+            payload = {
+                "meta": {
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    "count": len(rows),
+                },
+                "items": rows,
+            }
+            self._deferred_courses_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"우회 강좌 이력 저장 실패: {exc}")
 
     def _save_answer_bank(self) -> None:
         try:
@@ -85,6 +152,8 @@ class EKHNPAutomator:
 
     def _rebuild_answer_bank_indexes(self) -> None:
         q_index: dict[str, list[dict[str, Any]]] = {}
+        q_sig_index: dict[str, list[dict[str, Any]]] = {}
+        q_sig_optset_index: dict[str, list[dict[str, Any]]] = {}
         fuzzy_index: list[dict[str, Any]] = []
         for item in self._answer_bank_items.values():
             if not isinstance(item, dict):
@@ -95,9 +164,22 @@ class EKHNPAutomator:
                 q_norm = self._normalize_answer_text(str(item.get("question", "")))
             if q_norm:
                 q_index.setdefault(q_norm, []).append(item)
+            q_match_norm = str(item.get("question_match_norm", "")).strip()
+            if not q_match_norm:
+                q_match_norm = self._normalize_question_text(str(item.get("question", "")))
+            q_sig = str(item.get("question_signature", "")).strip()
+            if not q_sig:
+                q_sig = self._question_signature_from_norm(q_match_norm)
+            if q_sig:
+                q_sig_index.setdefault(q_sig, []).append(item)
 
             options = [str(x).strip() for x in item.get("options", []) if str(x).strip()]
             option_norms = [self._normalize_answer_text(x) for x in options]
+            option_set_sig = str(item.get("option_set_signature", "")).strip()
+            if not option_set_sig:
+                option_set_sig = self._option_set_signature_from_norms(option_norms)
+            if q_sig and option_set_sig:
+                q_sig_optset_index.setdefault(f"{q_sig}||{option_set_sig}", []).append(item)
             option_tokens = [self._token_set_from_norm(x) for x in option_norms]
 
             ans_opt_norm = str(item.get("answer_option_norm", "")).strip()
@@ -113,13 +195,16 @@ class EKHNPAutomator:
                 {
                     "item": item,
                     "q_norm": q_norm,
-                    "q_tokens": self._token_set_from_norm(q_norm),
+                    "q_match_norm": q_match_norm,
+                    "q_tokens": self._token_set_from_norm(q_match_norm or q_norm),
                     "option_norms": option_norms,
                     "option_tokens": option_tokens,
                     "answer_opt_norm": ans_opt_norm,
                 }
             )
         self._answer_bank_qnorm_index = q_index
+        self._answer_bank_qsig_index = q_sig_index
+        self._answer_bank_qsig_optset_index = q_sig_optset_index
         self._answer_bank_fuzzy_index = fuzzy_index
 
     @staticmethod
@@ -177,6 +262,13 @@ class EKHNPAutomator:
         key = self._course_title_key(title)
         if key:
             self._deferred_exam_course_keys.add(key)
+            self._deferred_exam_course_history[key] = {
+                "key": key,
+                "title": title,
+                "reason": str(reason or "").strip(),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            self._save_deferred_exam_courses()
         self._log(f"과정 우회 등록: {title} / {reason}")
 
     def _maybe_skip_course_on_low_exam_attempts(
@@ -797,17 +889,39 @@ class EKHNPAutomator:
                     )
                     self._refresh_classroom_page(classroom_page)
                     state = self._extract_course_completion_state(classroom_page)
-                    if not bool(state.get("known", False)):
-                        if self._is_course_marked_completed_in_status(page, self._last_opened_course_title):
-                            self._log(
-                                f"수료표(발급)에서 과정 완료 확인: {self._last_opened_course_title}"
-                            )
-                            return solve_result
-                        return solve_result
-                    if bool(state.get("completed", False)):
-                        return solve_result
-                    if self._is_course_marked_completed_in_status(page, self._last_opened_course_title):
+
+                    completed_by_status = self._is_course_marked_completed_in_status(page, self._last_opened_course_title)
+                    if completed_by_status:
                         self._log(f"수료표(발급)에서 과정 완료 확인: {self._last_opened_course_title}")
+                    known = bool(state.get("known", False))
+                    completed = bool(state.get("completed", False)) or completed_by_status
+
+                    attempt_no = retry_round + 1
+                    attempt_payload = (
+                        dict(self._last_exam_solve_payload)
+                        if isinstance(self._last_exam_solve_payload, dict)
+                        else {}
+                    )
+                    learn = self._learn_answers_from_result_panel(classroom_page)
+                    report = self._write_exam_quality_report(
+                        course_title=self._last_opened_course_title,
+                        attempt_no=attempt_no,
+                        solve_payload=attempt_payload,
+                        learn_payload=learn,
+                        completion_state=state,
+                    )
+                    report_path = str(report.get("path", "")).strip()
+                    if report_path:
+                        self._log(f"시험 파싱 품질 리포트 저장: {report_path}")
+                    self._update_evidence_fail_history(
+                        question_records=[x for x in attempt_payload.get("question_records", []) if isinstance(x, dict)],
+                        report_rows=[x for x in report.get("rows", []) if isinstance(x, dict)],
+                        fallback_failed_all=not completed,
+                    )
+
+                    if completed:
+                        return solve_result
+                    if not known:
                         return solve_result
 
                     retry_reason = str(state.get("reason", "")).strip()
@@ -848,7 +962,6 @@ class EKHNPAutomator:
                             classroom_page.url,
                         )
 
-                    learn = self._learn_answers_from_result_panel(classroom_page)
                     added = int(learn.get("added", 0))
                     found = int(learn.get("found", 0))
                     self._log(
@@ -1305,13 +1418,44 @@ class EKHNPAutomator:
                         )
                         self._refresh_classroom_page(classroom_page)
                         completion_guard = self._ensure_course_completed(classroom_page)
-                        if completion_guard is None:
-                            self._log(f"시험평가 합격 확인: attempt_round={retry_round + 1}")
-                            break
-                        if self._is_course_marked_completed_in_status(page, self._last_opened_course_title):
+                        completed_by_guard = completion_guard is None
+                        completed_by_status = self._is_course_marked_completed_in_status(page, self._last_opened_course_title)
+                        completed = completed_by_guard or completed_by_status
+                        if completed_by_status:
                             self._log(
                                 f"시험평가 후 수료표(발급)에서 과정 완료 확인: {self._last_opened_course_title}"
                             )
+
+                        attempt_no = retry_round + 1
+                        attempt_payload = (
+                            dict(self._last_exam_solve_payload)
+                            if isinstance(self._last_exam_solve_payload, dict)
+                            else {}
+                        )
+                        completion_state = {
+                            "known": True,
+                            "completed": bool(completed),
+                            "reason": "" if completion_guard is None else str(completion_guard.message),
+                        }
+                        learn = self._learn_answers_from_result_panel(classroom_page)
+                        report = self._write_exam_quality_report(
+                            course_title=self._last_opened_course_title,
+                            attempt_no=attempt_no,
+                            solve_payload=attempt_payload,
+                            learn_payload=learn,
+                            completion_state=completion_state,
+                        )
+                        report_path = str(report.get("path", "")).strip()
+                        if report_path:
+                            self._log(f"시험 파싱 품질 리포트 저장: {report_path}")
+                        self._update_evidence_fail_history(
+                            question_records=[x for x in attempt_payload.get("question_records", []) if isinstance(x, dict)],
+                            report_rows=[x for x in report.get("rows", []) if isinstance(x, dict)],
+                            fallback_failed_all=not completed,
+                        )
+
+                        if completed:
+                            self._log(f"시험평가 합격 확인: attempt_round={retry_round + 1}")
                             break
 
                         retry_reason = completion_guard.message.strip()
@@ -1349,7 +1493,6 @@ class EKHNPAutomator:
                                 classroom_page.url,
                             )
 
-                        learn = self._learn_answers_from_result_panel(classroom_page)
                         added = int(learn.get("added", 0))
                         found = int(learn.get("found", 0))
                         self._log(
@@ -2098,7 +2241,12 @@ class EKHNPAutomator:
                 title = f"{idx + 1}번째 과정"
             title_key = self._course_title_key(title)
             if title_key and title_key in self._deferred_exam_course_keys:
-                self._log(f"우회 등록 과정 스킵: {title}")
+                history = self._deferred_exam_course_history.get(title_key, {})
+                reason = str(history.get("reason", "")).strip()
+                if reason:
+                    self._log(f"우회 등록 과정 스킵: {title} / reason={reason}")
+                else:
+                    self._log(f"우회 등록 과정 스킵: {title}")
                 continue
             return title, button
         return "", None
@@ -2760,6 +2908,57 @@ class EKHNPAutomator:
             "total_hint": total_hint,
         }
 
+    def _blocked_evidence_ids_for_question(self, question: str, min_streak: int = 2) -> set[str]:
+        q_sig = self._question_signature(question)
+        if not q_sig:
+            return set()
+        slot = self._question_evidence_fail_streak.get(q_sig, {})
+        if not isinstance(slot, dict):
+            return set()
+        return {str(eid).strip() for eid, streak in slot.items() if int(streak) >= int(min_streak) and str(eid).strip()}
+
+    def _update_evidence_fail_history(
+        self,
+        question_records: list[dict[str, Any]],
+        report_rows: list[dict[str, Any]],
+        fallback_failed_all: bool = False,
+    ) -> None:
+        if not question_records:
+            return
+        result_by_qsig: dict[str, list[dict[str, Any]]] = {}
+        for row in report_rows:
+            if not isinstance(row, dict):
+                continue
+            q_sig = str(row.get("question_signature", "")).strip()
+            if not q_sig:
+                continue
+            result_by_qsig.setdefault(q_sig, []).append(row)
+
+        for rec in question_records:
+            if not isinstance(rec, dict):
+                continue
+            question = str(rec.get("question", "")).strip()
+            if not question:
+                continue
+            q_sig = self._question_signature(question)
+            if not q_sig:
+                continue
+            evidence_ids = [str(x).strip() for x in rec.get("evidence_ids", []) if str(x).strip()]
+            if not evidence_ids:
+                continue
+            slot = self._question_evidence_fail_streak.setdefault(q_sig, {})
+            rows = result_by_qsig.get(q_sig, [])
+            correctness_values = [r.get("is_correct") for r in rows if isinstance(r.get("is_correct"), bool)]
+            if correctness_values:
+                is_correct = any(bool(v) for v in correctness_values)
+            else:
+                is_correct = not fallback_failed_all
+            for eid in evidence_ids[:3]:
+                if is_correct:
+                    slot[eid] = 0
+                else:
+                    slot[eid] = int(slot.get(eid, 0)) + 1
+
     def _solve_exam_stream_with_rag(
         self,
         exam_page: Page,
@@ -2774,9 +2973,21 @@ class EKHNPAutomator:
         skipped = 0
         low_conf_used = 0
         total_hint = 0
+        question_records: list[dict[str, Any]] = []
         pass_score = max(0, min(100, int(getattr(self.settings, "rag_pass_score", 80))))
         low_conf_floor = max(0.0, min(1.0, float(getattr(self.settings, "rag_low_conf_floor", 0.55))))
         fallback_low_conf_budget = max(1, int(max_questions * 0.2))
+
+        def _payload(success: bool, message: str) -> dict[str, Any]:
+            return {
+                "success": bool(success),
+                "message": str(message),
+                "solved": solved,
+                "skipped": skipped,
+                "low_conf_used": low_conf_used,
+                "question_records": list(question_records),
+                "exam_runtime_meta": dict(exam_runtime_meta),
+            }
 
         self._log(
             "종합평가 RAG 자동풀이 시작 "
@@ -2794,13 +3005,7 @@ class EKHNPAutomator:
         for _ in range(max_questions):
             snap = self._extract_exam_question_snapshot(exam_page)
             if snap is None:
-                return {
-                    "success": False,
-                    "message": "문항 텍스트를 읽지 못했습니다.",
-                    "solved": solved,
-                    "skipped": skipped,
-                    "low_conf_used": low_conf_used,
-                }
+                return _payload(False, "문항 텍스트를 읽지 못했습니다.")
 
             question = str(snap.get("question_text", "")).strip()
             full_text = str(snap.get("full_text", "")).strip()
@@ -2812,20 +3017,8 @@ class EKHNPAutomator:
             if key in visited_keys:
                 if self._is_exam_last_question(current=current, total=total, total_hint=total_hint):
                     self._click_exam_submit_if_present(exam_page)
-                    return {
-                        "success": True,
-                        "message": "반복 감지 + 마지막 문항으로 판단되어 제출",
-                        "solved": solved,
-                        "skipped": skipped,
-                        "low_conf_used": low_conf_used,
-                    }
-                return {
-                    "success": False,
-                    "message": f"이전 문항 반복 감지(current/total={current}/{max(total, total_hint)})",
-                    "solved": solved,
-                    "skipped": skipped,
-                    "low_conf_used": low_conf_used,
-                }
+                    return _payload(True, "반복 감지 + 마지막 문항으로 판단되어 제출")
+                return _payload(False, f"이전 문항 반복 감지(current/total={current}/{max(total, total_hint)})")
             visited_keys.add(key)
             if total > 0:
                 total_hint = max(total_hint, total)
@@ -2856,42 +3049,51 @@ class EKHNPAutomator:
                         )
                         break
                 if len(options) < 2:
-                    return {
-                        "success": False,
-                        "message": f"보기 추출 실패(current/total={current}/{total}, source={source})",
-                        "solved": solved,
-                        "skipped": skipped,
-                        "low_conf_used": low_conf_used,
-                    }
+                    return _payload(False, f"보기 추출 실패(current/total={current}/{total}, source={source})")
 
+            blocked_evidence_ids = self._blocked_evidence_ids_for_question(question)
+            if blocked_evidence_ids:
+                self._log(
+                    "연속 오답 근거 차단 적용: "
+                    f"Q {current}/{total} blocked={sorted(blocked_evidence_ids)[:3]}"
+                )
             cached_answer = self._lookup_answer_bank_choice(
                 question=question,
                 options=options,
                 exam_meta=exam_runtime_meta,
             )
-            if cached_answer is not None:
+            used_answer_bank = False
+            if cached_answer is not None and "answer-bank" not in blocked_evidence_ids:
                 choice = int(cached_answer.get("choice", 0))
                 confidence = float(cached_answer.get("confidence", 0.98))
                 reason = str(cached_answer.get("reason", "answer-bank"))
                 evidence_ids: list[str] = ["answer-bank"]
+                used_answer_bank = True
                 self._log(f"정답 인덱스 매칭 사용: Q {current}/{total} -> choice={choice}, conf={confidence:.2f}")
             else:
+                if cached_answer is not None and "answer-bank" in blocked_evidence_ids:
+                    self._log(f"Q {current}/{total} answer-bank 연속 실패 감지로 2순위 근거 전환")
+                solve_top_k = max(int(top_k), int(top_k) + len(blocked_evidence_ids))
                 try:
-                    decision = solver.solve(question=question, options=options, top_k=top_k)
+                    decision = solver.solve(
+                        question=question,
+                        options=options,
+                        top_k=solve_top_k,
+                        exclude_evidence_ids=sorted(blocked_evidence_ids) if blocked_evidence_ids else None,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     self._log(f"RAG 풀이 1차 실패: {exc} / 재시도 1회")
                     exam_page.wait_for_timeout(600)
                     retry_top_k = max(2, min(int(top_k), 8))
                     try:
-                        decision = solver.solve(question=question, options=options, top_k=retry_top_k)
+                        decision = solver.solve(
+                            question=question,
+                            options=options,
+                            top_k=retry_top_k + len(blocked_evidence_ids),
+                            exclude_evidence_ids=sorted(blocked_evidence_ids) if blocked_evidence_ids else None,
+                        )
                     except Exception as retry_exc:  # noqa: BLE001
-                        return {
-                            "success": False,
-                            "message": f"RAG 풀이 호출 실패: {retry_exc}",
-                            "solved": solved,
-                            "skipped": skipped,
-                            "low_conf_used": low_conf_used,
-                        }
+                        return _payload(False, f"RAG 풀이 호출 실패: {retry_exc}")
                 choice = int(getattr(decision, "choice", 0))
                 confidence = float(getattr(decision, "confidence", 0.0))
                 reason = str(getattr(decision, "reason", ""))
@@ -2902,13 +3104,7 @@ class EKHNPAutomator:
             )
 
             if choice < 1 or choice > len(options):
-                return {
-                    "success": False,
-                    "message": f"LLM 선택지 번호 비정상: {choice}",
-                    "solved": solved,
-                    "skipped": skipped,
-                    "low_conf_used": low_conf_used,
-                }
+                return _payload(False, f"LLM 선택지 번호 비정상: {choice}")
             if confidence < confidence_threshold:
                 retry_top_k = min(20, max(int(top_k) + 2, int(top_k * 1.5)))
                 self._log(
@@ -2916,7 +3112,12 @@ class EKHNPAutomator:
                     f"Q {current}/{total} conf={confidence:.2f} -> top_k={retry_top_k}"
                 )
                 try:
-                    retry_decision = solver.solve(question=question, options=options, top_k=retry_top_k)
+                    retry_decision = solver.solve(
+                        question=question,
+                        options=options,
+                        top_k=retry_top_k + len(blocked_evidence_ids),
+                        exclude_evidence_ids=sorted(blocked_evidence_ids) if blocked_evidence_ids else None,
+                    )
                     retry_choice = int(getattr(retry_decision, "choice", 0))
                     retry_conf = float(getattr(retry_decision, "confidence", 0.0))
                     retry_reason = str(getattr(retry_decision, "reason", ""))
@@ -2948,57 +3149,47 @@ class EKHNPAutomator:
                         )
                     else:
                         skipped += 1
-                        return {
-                            "success": False,
-                            "message": (
+                        return _payload(
+                            False,
+                            (
                                 f"LLM 신뢰도 낮음(conf={confidence:.2f}, floor={low_conf_floor:.2f}, "
                                 f"low_conf_used={low_conf_used}/{dynamic_budget}): {reason}"
                             ),
-                            "solved": solved,
-                            "skipped": skipped,
-                            "low_conf_used": low_conf_used,
-                        }
+                        )
 
             if not self._click_exam_option(exam_page, choice, options=options, current=current):
                 picked_text = options[choice - 1] if 1 <= choice <= len(options) else ""
-                return {
-                    "success": False,
-                    "message": f"선택지 클릭 실패: {choice} ({picked_text})",
-                    "solved": solved,
-                    "skipped": skipped,
-                    "low_conf_used": low_conf_used,
+                return _payload(False, f"선택지 클릭 실패: {choice} ({picked_text})")
+            question_records.append(
+                {
+                    "question_no": current,
+                    "question": question,
+                    "question_norm": self._normalize_question_text(question),
+                    "question_signature": self._question_signature(question),
+                    "options": list(options),
+                    "selected_choice": int(choice),
+                    "selected_option": options[choice - 1] if 1 <= choice <= len(options) else "",
+                    "confidence": float(confidence),
+                    "reason": reason,
+                    "evidence_ids": list(evidence_ids or []),
+                    "source": source,
+                    "used_answer_bank": bool(used_answer_bank),
+                    "blocked_evidence_ids": sorted(blocked_evidence_ids),
                 }
+            )
             solved += 1
 
             is_last_question = self._is_exam_last_question(current=current, total=total, total_hint=total_hint)
             if is_last_question:
                 self._click_exam_submit_if_present(exam_page)
-                return {
-                    "success": True,
-                    "message": "마지막 문항 제출 완료",
-                    "solved": solved,
-                    "skipped": skipped,
-                    "low_conf_used": low_conf_used,
-                }
+                return _payload(True, "마지막 문항 제출 완료")
 
             if not self._click_exam_next(exam_page, current=current):
                 if self._has_exam_submit_control(exam_page):
                     self._log("다음 버튼 없음 + 제출 버튼 감지: 최종 제출을 시도합니다.")
                     self._click_exam_submit_if_present(exam_page)
-                    return {
-                        "success": True,
-                        "message": "다음 버튼 없음 + 제출 버튼 감지로 최종 제출 시도 후 종료",
-                        "solved": solved,
-                        "skipped": skipped,
-                        "low_conf_used": low_conf_used,
-                    }
-                return {
-                    "success": False,
-                    "message": f"다음 문항 버튼을 찾지 못했습니다(current/total={current}/{max(total, total_hint)})",
-                    "solved": solved,
-                    "skipped": skipped,
-                    "low_conf_used": low_conf_used,
-                }
+                    return _payload(True, "다음 버튼 없음 + 제출 버튼 감지로 최종 제출 시도 후 종료")
+                return _payload(False, f"다음 문항 버튼을 찾지 못했습니다(current/total={current}/{max(total, total_hint)})")
 
             if not self._wait_exam_question_change(
                 exam_page, key, prev_current=current, prev_total=max(total, total_hint)
@@ -3033,24 +3224,12 @@ class EKHNPAutomator:
                     current=current,
                     dialog_messages=dialog_messages,
                 )
-                return {
-                    "success": False,
-                    "message": (
-                        f"다음 클릭 후 문항 변화가 없습니다(current/total={current}/{max(total, total_hint)}). "
-                        f"{diag}"
-                    ),
-                    "solved": solved,
-                    "skipped": skipped,
-                    "low_conf_used": low_conf_used,
-                }
+                return _payload(
+                    False,
+                    f"다음 클릭 후 문항 변화가 없습니다(current/total={current}/{max(total, total_hint)}). {diag}",
+                )
 
-        return {
-            "success": False,
-            "message": "문항 상한 도달",
-            "solved": solved,
-            "skipped": skipped,
-            "low_conf_used": low_conf_used,
-        }
+        return _payload(False, "문항 상한 도달")
 
     def _auto_solve_exam_with_rag(
         self,
@@ -3088,6 +3267,7 @@ class EKHNPAutomator:
             confidence_threshold=float(conf_th),
             dialog_messages=dialog_messages,
         )
+        self._last_exam_solve_payload = dict(solve_result)
         if not solve_result.get("success"):
             return LoginResult(False, str(solve_result.get("message", "시험 자동풀이 실패")), exam_page.url)
 
@@ -3459,19 +3639,40 @@ class EKHNPAutomator:
         return re.sub(r"[^0-9A-Za-z가-힣]+", "", key_raw)[:240]
 
     @staticmethod
-    def _normalize_answer_text(text: str) -> str:
+    @lru_cache(maxsize=20000)
+    def _normalize_answer_text_cached(text: str) -> str:
         src = str(text or "").lower()
         src = re.sub(r"\s+", " ", src).strip()
         src = re.sub(r"[^0-9a-z가-힣 ]+", " ", src)
         src = re.sub(r"\s+", " ", src).strip()
         return src
 
+    @classmethod
+    def _normalize_answer_text(cls, text: str) -> str:
+        return cls._normalize_answer_text_cached(str(text or ""))
+
+    @classmethod
+    def _normalize_question_text(cls, text: str) -> str:
+        src = cls._normalize_answer_text(text)
+        if not src:
+            return ""
+        src = re.sub(r"^(?:문항|문제|q)\s*\d{1,3}\s*", " ", src)
+        src = re.sub(r"^\d{1,3}\s*", " ", src)
+        src = re.sub(r"^(?:객관식|주관식|단일형|복수형|보기)\s*", " ", src)
+        src = re.sub(r"\s+", " ", src).strip()
+        return src
+
     @staticmethod
-    def _token_set_from_norm(text_norm: str) -> set[str]:
+    @lru_cache(maxsize=30000)
+    def _token_set_from_norm_cached(text_norm: str) -> frozenset[str]:
         src = str(text_norm or "").strip()
         if not src:
-            return set()
-        return {tok for tok in src.split(" ") if len(tok) >= 2}
+            return frozenset()
+        return frozenset(tok for tok in src.split(" ") if len(tok) >= 2)
+
+    @classmethod
+    def _token_set_from_norm(cls, text_norm: str) -> set[str]:
+        return set(cls._token_set_from_norm_cached(str(text_norm or "")))
 
     @classmethod
     def _text_token_set(cls, text: str) -> set[str]:
@@ -3487,11 +3688,60 @@ class EKHNPAutomator:
         return float(inter / union) if union > 0 else 0.0
 
     @classmethod
+    def _question_signature_from_norm(cls, question_match_norm: str) -> str:
+        q_norm = str(question_match_norm or "").strip()
+        if not q_norm:
+            return ""
+        q_toks = sorted(cls._token_set_from_norm(q_norm))
+        base = " ".join(q_toks[:40]) if q_toks else q_norm[:220]
+        return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _question_signature(cls, question: str) -> str:
+        return cls._question_signature_from_norm(cls._normalize_question_text(question))
+
+    @classmethod
+    def _option_set_signature_from_norms(cls, option_norms: list[str]) -> str:
+        cleaned = sorted({str(x).strip() for x in option_norms if str(x).strip()})
+        if not cleaned:
+            return ""
+        return hashlib.sha1("|".join(cleaned[:8]).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _option_set_signature(cls, options: list[str]) -> str:
+        norms = [cls._normalize_answer_text(x) for x in options if str(x).strip()]
+        return cls._option_set_signature_from_norms(norms)
+
+    @classmethod
     def _make_answer_bank_key(cls, question: str, options: list[str]) -> str:
-        q = cls._normalize_answer_text(question)
+        q = cls._normalize_question_text(question)
         opts = [cls._normalize_answer_text(x) for x in options if cls._normalize_answer_text(x)]
         base = f"q={q}||o={'|'.join(opts[:5])}"
         return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+    def _map_answer_option_norm_to_choice(
+        self, answer_option_norm: str, current_option_norms: list[str]
+    ) -> tuple[int, float, str]:
+        ans = str(answer_option_norm or "").strip()
+        if not ans:
+            return 0, 0.0, ""
+        ans_toks = self._token_set_from_norm(ans)
+        best_idx = 0
+        best_sim = 0.0
+        best_mode = ""
+        for idx, now_opt in enumerate(current_option_norms, start=1):
+            if not now_opt:
+                continue
+            if ans == now_opt:
+                return idx, 1.0, "exact"
+            if ans in now_opt or now_opt in ans:
+                return idx, 0.96, "contains"
+            sim = self._jaccard(ans_toks, self._token_set_from_norm(now_opt))
+            if sim > best_sim:
+                best_sim = sim
+                best_idx = idx
+                best_mode = "jaccard"
+        return best_idx, best_sim, best_mode
 
     @staticmethod
     def _is_answer_item_scope_match(item: dict[str, Any], exam_meta: Optional[dict[str, str]]) -> bool:
@@ -3521,18 +3771,42 @@ class EKHNPAutomator:
         exact_key = self._make_answer_bank_key(question, options)
         exact = self._answer_bank_items.get(exact_key)
         if isinstance(exact, dict) and self._is_answer_item_scope_match(exact, exam_meta):
-            try:
-                idx = int(exact.get("answer_index", 0))
-            except Exception:  # noqa: BLE001
-                idx = 0
-            if 1 <= idx <= len(options):
-                return {"choice": idx, "reason": "answer-bank exact", "confidence": 0.99}
+            answer_opt_norm = str(exact.get("answer_option_norm", "")).strip()
+            if not answer_opt_norm:
+                saved_opts_exact = [self._normalize_answer_text(str(x)) for x in exact.get("options", [])]
+                try:
+                    exact_idx = int(exact.get("answer_index", 0))
+                except Exception:  # noqa: BLE001
+                    exact_idx = 0
+                if 1 <= exact_idx <= len(saved_opts_exact):
+                    answer_opt_norm = saved_opts_exact[exact_idx - 1]
+            opt_norms_exact = [self._normalize_answer_text(x) for x in options]
+            mapped_idx, mapped_sim, _ = self._map_answer_option_norm_to_choice(answer_opt_norm, opt_norms_exact)
+            if 1 <= mapped_idx <= len(options):
+                conf = 0.99 if mapped_sim >= 0.98 else min(0.98, 0.92 + 0.06 * mapped_sim)
+                return {"choice": mapped_idx, "reason": "answer-bank exact", "confidence": conf}
 
         q_norm = self._normalize_answer_text(question)
+        q_match_norm = self._normalize_question_text(question)
+        q_sig = self._question_signature_from_norm(q_match_norm)
         opt_norms = [self._normalize_answer_text(x) for x in options]
-        for item in self._answer_bank_qnorm_index.get(q_norm, []):
+        option_set_sig = self._option_set_signature_from_norms(opt_norms)
+        ordered_candidates: list[dict[str, Any]] = []
+        if q_sig and option_set_sig:
+            ordered_candidates.extend(self._answer_bank_qsig_optset_index.get(f"{q_sig}||{option_set_sig}", []))
+        if q_norm:
+            ordered_candidates.extend(self._answer_bank_qnorm_index.get(q_norm, []))
+        if q_sig:
+            ordered_candidates.extend(self._answer_bank_qsig_index.get(q_sig, []))
+
+        seen_items: set[int] = set()
+        for item in ordered_candidates:
             if not isinstance(item, dict):
                 continue
+            marker = id(item)
+            if marker in seen_items:
+                continue
+            seen_items.add(marker)
             if not self._is_answer_item_scope_match(item, exam_meta):
                 continue
             ans_opt_norm = str(item.get("answer_option_norm", "")).strip()
@@ -3545,33 +3819,33 @@ class EKHNPAutomator:
                 if 1 <= idx_saved <= len(saved_opts):
                     ans_opt_norm = saved_opts[idx_saved - 1]
             if ans_opt_norm:
-                ans_toks = self._token_set_from_norm(ans_opt_norm)
-                best_idx = 0
-                best_sim = 0.0
-                for idx, now_opt in enumerate(opt_norms, start=1):
-                    if ans_opt_norm == now_opt:
-                        return {"choice": idx, "reason": "answer-bank text-match", "confidence": 0.98}
-                    if ans_opt_norm in now_opt or now_opt in ans_opt_norm:
-                        return {"choice": idx, "reason": "answer-bank text-match", "confidence": 0.97}
-                    sim = self._jaccard(ans_toks, self._token_set_from_norm(now_opt))
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_idx = idx
-                if best_idx > 0 and best_sim >= 0.78:
-                    return {"choice": best_idx, "reason": "answer-bank text-fuzzy", "confidence": 0.95}
+                mapped_idx, mapped_sim, mapped_mode = self._map_answer_option_norm_to_choice(ans_opt_norm, opt_norms)
+                if mapped_idx > 0 and mapped_mode in {"exact", "contains"}:
+                    conf = 0.98 if mapped_mode == "exact" else 0.97
+                    return {"choice": mapped_idx, "reason": "answer-bank text-match", "confidence": conf}
+                if mapped_idx > 0 and mapped_sim >= 0.76:
+                    conf = min(0.96, 0.90 + 0.08 * mapped_sim)
+                    return {"choice": mapped_idx, "reason": "answer-bank text-fuzzy", "confidence": conf}
 
-            # 보기 순서가 동일하게 유지된 경우에만 번호 매칭을 허용합니다.
-            saved_opts_norm = [self._normalize_answer_text(str(x)) for x in item.get("options", [])]
-            if saved_opts_norm and len(saved_opts_norm) == len(opt_norms) and saved_opts_norm == opt_norms:
+            # 보기 순서 변경 불변 매칭: 문항 시그니처 + 보기 집합이 같으면 정답 텍스트로 재매핑합니다.
+            saved_opts_norm = [self._normalize_answer_text(str(x)) for x in item.get("options", []) if str(x).strip()]
+            saved_option_set_sig = str(item.get("option_set_signature", "")).strip()
+            if not saved_option_set_sig:
+                saved_option_set_sig = self._option_set_signature_from_norms(saved_opts_norm)
+            if option_set_sig and saved_option_set_sig and option_set_sig == saved_option_set_sig:
                 try:
-                    idx = int(item.get("answer_index", 0))
+                    idx_saved = int(item.get("answer_index", 0))
                 except Exception:  # noqa: BLE001
-                    idx = 0
-                if 1 <= idx <= len(options):
-                    return {"choice": idx, "reason": "answer-bank order-match", "confidence": 0.92}
+                    idx_saved = 0
+                if 1 <= idx_saved <= len(saved_opts_norm):
+                    ans_from_saved = saved_opts_norm[idx_saved - 1]
+                    mapped_idx, mapped_sim, _ = self._map_answer_option_norm_to_choice(ans_from_saved, opt_norms)
+                    if mapped_idx > 0 and mapped_sim >= 0.72:
+                        conf = min(0.97, 0.91 + 0.06 * mapped_sim)
+                        return {"choice": mapped_idx, "reason": "answer-bank order-invariant", "confidence": conf}
 
         # 섞임/표현차 대응: 문항+보기 유사도 퍼지 매칭
-        q_tokens = self._token_set_from_norm(q_norm)
+        q_tokens = self._token_set_from_norm(q_match_norm or q_norm)
         now_opt_norms = opt_norms
         now_opt_tokens = [self._token_set_from_norm(x) for x in now_opt_norms]
 
@@ -3590,42 +3864,36 @@ class EKHNPAutomator:
             if not isinstance(item_q_tokens, set):
                 item_q_tokens = set()
             q_sim = self._jaccard(q_tokens, item_q_tokens)
-            if q_sim < 0.35:
+            if q_sim < 0.30:
                 continue
 
             opt_hit = 0
             for cur_toks in now_opt_tokens:
                 if not cur_toks:
                     continue
-                if any(self._jaccard(cur_toks, it) >= 0.60 for it in item_opt_tokens if it):
+                if any(self._jaccard(cur_toks, it) >= 0.56 for it in item_opt_tokens if it):
                     opt_hit += 1
             opt_sim = opt_hit / max(1, len(now_opt_tokens))
-            if opt_sim < 0.55:
+            if opt_sim < 0.50:
                 continue
 
             ans_opt_norm = str(packed.get("answer_opt_norm", "")).strip()
             if not ans_opt_norm:
                 continue
 
-            mapped_idx = 0
-            mapped_sim = 0.0
-            for idx, now_opt in enumerate(now_opt_norms, start=1):
-                if ans_opt_norm == now_opt or ans_opt_norm in now_opt or now_opt in ans_opt_norm:
-                    mapped_idx = idx
-                    mapped_sim = 1.0
-                    break
-            if mapped_idx == 0:
-                ans_toks = self._text_token_set(ans_opt_norm)
-                best_local_idx = 0
-                best_local = 0.0
-                for idx, now_toks in enumerate(now_opt_tokens, start=1):
-                    sim = self._jaccard(ans_toks, now_toks)
-                    if sim > best_local:
-                        best_local = sim
-                        best_local_idx = idx
-                if best_local >= 0.72:
-                    mapped_idx = best_local_idx
-                    mapped_sim = best_local
+            mapped_idx, mapped_sim, _ = self._map_answer_option_norm_to_choice(ans_opt_norm, now_opt_norms)
+            if mapped_idx == 0 and packed.get("option_norms"):
+                saved_opt_norms = [str(x) for x in packed.get("option_norms", [])]
+                saved_set = self._option_set_signature_from_norms(saved_opt_norms)
+                if saved_set and saved_set == option_set_sig:
+                    try:
+                        idx_saved = int(item.get("answer_index", 0))
+                    except Exception:  # noqa: BLE001
+                        idx_saved = 0
+                    if 1 <= idx_saved <= len(saved_opt_norms):
+                        mapped_idx, mapped_sim, _ = self._map_answer_option_norm_to_choice(
+                            saved_opt_norms[idx_saved - 1], now_opt_norms
+                        )
             if mapped_idx == 0:
                 continue
 
@@ -3636,7 +3904,7 @@ class EKHNPAutomator:
                 best_map_sim = mapped_sim
                 best_reason = f"answer-bank fuzzy q={q_sim:.2f} opt={opt_sim:.2f}"
 
-        if best_choice > 0 and best_score >= 0.68 and best_map_sim >= 0.78:
+        if best_choice > 0 and best_score >= 0.62 and best_map_sim >= 0.70:
             conf = min(0.96, 0.74 + 0.20 * best_score)
             return {"choice": best_choice, "reason": best_reason, "confidence": conf}
         return None
@@ -3656,6 +3924,9 @@ class EKHNPAutomator:
         key = self._make_answer_bank_key(question, options)
         now_ts = datetime.now().isoformat(timespec="seconds")
         answer_opt = options[answer_index - 1].strip() if 1 <= answer_index <= len(options) else ""
+        question_norm = self._normalize_answer_text(question)
+        question_match_norm = self._normalize_question_text(question)
+        option_norms = [self._normalize_answer_text(str(x)) for x in options]
         prev_hits = 0
         if key in self._answer_bank_items:
             try:
@@ -3665,8 +3936,12 @@ class EKHNPAutomator:
 
         payload: dict[str, Any] = {
             "question": question.strip(),
-            "question_norm": self._normalize_answer_text(question),
+            "question_norm": question_norm,
+            "question_match_norm": question_match_norm,
+            "question_signature": self._question_signature_from_norm(question_match_norm),
             "options": [str(x).strip() for x in options],
+            "option_norms": option_norms,
+            "option_set_signature": self._option_set_signature_from_norms(option_norms),
             "answer_index": int(answer_index),
             "answer_option": answer_opt,
             "answer_option_norm": self._normalize_answer_text(answer_opt),
@@ -3977,6 +4252,19 @@ class EKHNPAutomator:
         entries: list[dict[str, Any]] = []
         for txt in unique_texts:
             entries.extend(self._extract_answer_entries_from_review_text(txt))
+        deduped_entries: list[dict[str, Any]] = []
+        seen_entry_keys: set[str] = set()
+        for ent in entries:
+            if not isinstance(ent, dict):
+                continue
+            q_sig = self._question_signature(str(ent.get("question", "")))
+            ans_idx = int(ent.get("answer_index", 0) or 0)
+            key = f"{q_sig}:{ans_idx}"
+            if key in seen_entry_keys:
+                continue
+            seen_entry_keys.add(key)
+            deduped_entries.append(ent)
+        entries = deduped_entries
 
         added = 0
         meta_map = self._parse_js_object_map(onclick)
@@ -4023,7 +4311,165 @@ class EKHNPAutomator:
             "added": added,
             "found": len(entries),
             "reason": f"resultYn={panel.get('resultYn', '')}, texts={len(unique_texts)}",
+            "entries": entries,
+            "exam_meta": meta_map,
+            "raw_text_count": len(unique_texts),
         }
+
+    def _build_exam_quality_rows(
+        self,
+        question_records: list[dict[str, Any]],
+        result_entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        if not question_records:
+            return rows
+
+        entry_index: list[dict[str, Any]] = []
+        for ent in result_entries:
+            if not isinstance(ent, dict):
+                continue
+            q = str(ent.get("question", "")).strip()
+            opts = [str(x).strip() for x in ent.get("options", []) if str(x).strip()]
+            ans_idx = int(ent.get("answer_index", 0) or 0)
+            if not q or len(opts) < 2 or ans_idx < 1 or ans_idx > len(opts):
+                continue
+            q_norm = self._normalize_question_text(q)
+            q_sig = self._question_signature_from_norm(q_norm)
+            opt_norms = [self._normalize_answer_text(x) for x in opts]
+            entry_index.append(
+                {
+                    "raw": ent,
+                    "question": q,
+                    "question_norm": q_norm,
+                    "question_signature": q_sig,
+                    "q_tokens": self._token_set_from_norm(q_norm),
+                    "options": opts,
+                    "option_norms": opt_norms,
+                    "answer_index": ans_idx,
+                    "answer_option_norm": opt_norms[ans_idx - 1],
+                    "option_set_sig": self._option_set_signature_from_norms(opt_norms),
+                }
+            )
+
+        for rec in question_records:
+            if not isinstance(rec, dict):
+                continue
+            q = str(rec.get("question", "")).strip()
+            opts = [str(x).strip() for x in rec.get("options", []) if str(x).strip()]
+            sel_choice = int(rec.get("selected_choice", 0) or 0)
+            sel_opt = str(rec.get("selected_option", "")).strip()
+            q_norm = self._normalize_question_text(q)
+            q_sig = self._question_signature_from_norm(q_norm)
+            q_tokens = self._token_set_from_norm(q_norm)
+            opt_norms = [self._normalize_answer_text(x) for x in opts]
+            option_set_sig = self._option_set_signature_from_norms(opt_norms)
+
+            best: Optional[dict[str, Any]] = None
+            best_score = -1.0
+            for ent in entry_index:
+                score = 0.0
+                if q_sig and q_sig == str(ent.get("question_signature", "")):
+                    score += 0.82
+                else:
+                    q_sim = self._jaccard(q_tokens, set(ent.get("q_tokens", set())))
+                    score += 0.62 * q_sim
+                ent_opt_set = str(ent.get("option_set_sig", ""))
+                if option_set_sig and ent_opt_set and option_set_sig == ent_opt_set:
+                    score += 0.24
+                else:
+                    ent_opts = set(ent.get("option_norms", []))
+                    score += 0.18 * self._jaccard(set(opt_norms), ent_opts)
+                if score > best_score:
+                    best = ent
+                    best_score = score
+
+            correct_choice = 0
+            correct_option = ""
+            is_correct: Optional[bool] = None
+            matched = bool(best is not None and best_score >= 0.35)
+            if matched and best is not None:
+                ans_opt_norm = str(best.get("answer_option_norm", "")).strip()
+                mapped_idx, mapped_sim, _ = self._map_answer_option_norm_to_choice(ans_opt_norm, opt_norms)
+                if mapped_idx > 0 and mapped_sim >= 0.64:
+                    correct_choice = mapped_idx
+                    correct_option = opts[mapped_idx - 1] if mapped_idx <= len(opts) else ""
+                    if sel_choice > 0:
+                        is_correct = sel_choice == correct_choice
+
+            rows.append(
+                {
+                    "question_no": int(rec.get("question_no", 0) or 0),
+                    "question": q,
+                    "question_signature": q_sig,
+                    "selected_choice": sel_choice,
+                    "selected_option": sel_opt,
+                    "correct_choice": correct_choice,
+                    "correct_option": correct_option,
+                    "is_correct": is_correct,
+                    "confidence": float(rec.get("confidence", 0.0) or 0.0),
+                    "reason": str(rec.get("reason", "")),
+                    "evidence_ids": [str(x) for x in rec.get("evidence_ids", []) if str(x).strip()],
+                    "source": str(rec.get("source", "")),
+                    "used_answer_bank": bool(rec.get("used_answer_bank", False)),
+                    "matched_result_entry": matched,
+                    "match_score": round(best_score if best_score > 0 else 0.0, 4),
+                }
+            )
+        return rows
+
+    def _write_exam_quality_report(
+        self,
+        *,
+        course_title: str,
+        attempt_no: int,
+        solve_payload: dict[str, Any],
+        learn_payload: dict[str, Any],
+        completion_state: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        question_records = [x for x in solve_payload.get("question_records", []) if isinstance(x, dict)]
+        result_entries = [x for x in learn_payload.get("entries", []) if isinstance(x, dict)]
+        rows = self._build_exam_quality_rows(question_records, result_entries)
+
+        total = len(rows)
+        matched = sum(1 for r in rows if bool(r.get("matched_result_entry")))
+        known = sum(1 for r in rows if isinstance(r.get("is_correct"), bool))
+        correct = sum(1 for r in rows if r.get("is_correct") is True)
+        wrong = sum(1 for r in rows if r.get("is_correct") is False)
+
+        summary = {
+            "questions": total,
+            "matched_result_entries": matched,
+            "correctness_known": known,
+            "correct": correct,
+            "wrong": wrong,
+            "unknown": max(0, total - known),
+        }
+        payload = {
+            "meta": {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "course_title": str(course_title or "").strip(),
+                "attempt_no": int(attempt_no),
+                "exam_meta": solve_payload.get("exam_runtime_meta") or learn_payload.get("exam_meta") or {},
+                "completion_state": completion_state or {},
+                "learn_reason": str(learn_payload.get("reason", "")),
+            },
+            "summary": summary,
+            "rows": rows,
+        }
+
+        path = ""
+        try:
+            self._exam_quality_report_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_course = re.sub(r"[^0-9A-Za-z가-힣]+", "_", str(course_title or "course")).strip("_") or "course"
+            out_path = self._exam_quality_report_dir / f"exam_quality_{stamp}_{safe_course}_try{int(attempt_no):02d}.json"
+            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            path = str(out_path)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"시험 품질 리포트 저장 실패: {exc}")
+
+        return {"path": path, "rows": rows, "summary": summary}
 
     def _click_exam_next(self, page: Page, current: int = 0) -> bool:
         selectors = [

@@ -780,6 +780,8 @@ def main() -> None:
                 "rag_web_weight": task_settings.rag_web_weight,
                 "completion_max_courses": task_settings.completion_max_courses,
                 "exam_answer_bank_path": task_settings.exam_answer_bank_path,
+                "exam_deferred_courses_path": task_settings.exam_deferred_courses_path,
+                "exam_quality_report_dir": task_settings.exam_quality_report_dir,
                 "exam_auto_retry_max": task_settings.exam_auto_retry_max,
                 "exam_retry_requires_answer_index": task_settings.exam_retry_requires_answer_index,
             }

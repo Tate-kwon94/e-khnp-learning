@@ -543,19 +543,38 @@ class RagExamSolver:
             scores.append((acc / total_w) if total_w > 0 else 0.0)
         return scores
 
-    def solve(self, question: str, options: list[str], top_k: int = 6) -> SolveResult:
+    def solve(
+        self,
+        question: str,
+        options: list[str],
+        top_k: int = 6,
+        exclude_evidence_ids: Optional[list[str]] = None,
+    ) -> SolveResult:
         if not question.strip():
             raise RuntimeError("Empty question text")
         if len(options) < 2:
             raise RuntimeError("Need at least 2 options")
 
         option_lines = "\n".join(f"{i}. {opt}" for i, opt in enumerate(options, start=1))
-        contexts = self._retrieve(question=question, options=options, top_k=top_k)
+        excluded_ids = {str(x).strip() for x in (exclude_evidence_ids or []) if str(x).strip()}
+        retrieve_k = max(1, int(top_k) + len(excluded_ids))
+        contexts = self._retrieve(question=question, options=options, top_k=retrieve_k)
         if not contexts:
             raise RuntimeError("No retrieved contexts")
+        if excluded_ids:
+            filtered_contexts = [
+                c for c in contexts if str(c["chunk"].get("id", "")).strip() not in excluded_ids
+            ]
+            if filtered_contexts:
+                contexts = filtered_contexts
+            contexts = contexts[: max(1, int(top_k))]
+            if not contexts:
+                raise RuntimeError("No retrieved contexts after evidence exclusion")
 
         local_scores = self._score_options(question, options, contexts)
         web_hits = self._search_web(question=question, options=options)
+        if excluded_ids:
+            web_hits = [h for h in web_hits if str(h.get("id", "")).strip() not in excluded_ids]
         web_scores = self._score_options_from_web_hits(question=question, options=options, web_hits=web_hits)
         option_scores = self._combine_scores(local_scores=local_scores, web_scores=web_scores, web_weight=self.web_weight)
         negative_question = self._is_negative_question(question)

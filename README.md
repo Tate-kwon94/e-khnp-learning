@@ -81,7 +81,7 @@ APP_ACCESS_ALLOW_OPEN=false
 APP_ACCESS_MAX_ATTEMPTS=5
 APP_ACCESS_COOLDOWN_SEC=300
 APP_ACCESS_SESSION_TTL_MIN=240
-APP_WORKER_COUNT=1
+APP_WORKER_COUNT=5
 APP_QUEUE_MAX_PENDING=20
 APP_QUEUE_MAX_HISTORY=200
 APP_SECURITY_AUDIT_ENABLED=true
@@ -176,11 +176,28 @@ git push
 - 접속 인증 세션은 `APP_ACCESS_SESSION_TTL_MIN`분 후 재인증
 - 실패 횟수/잠금은 서버 전체 세션에 공통 적용되며 재시작 후에도 `.runtime/access_guard.json`으로 이어집니다.
 - 자동화 실행은 작업 큐/워커 분리 구조(`APP_WORKER_COUNT`)로 백그라운드 처리
+- 운영 기본값은 `APP_WORKER_COUNT=5`이며, 5개를 초과한 작업은 자동으로 `pending(대기열)`로 전환됩니다.
 - 큐 폭주 방지: `APP_QUEUE_MAX_PENDING`, `APP_QUEUE_MAX_HISTORY`로 등록/보관 한도 제어
 - 보안 감사로그: `APP_SECURITY_AUDIT_ENABLED=true`일 때 `logs/security_audit.log` 기록
 - 작업 로그는 비밀번호/접속코드 패턴을 자동 마스킹 처리
 - 계정 정보는 로그에 저장하지 않습니다.
 - 운영 정책: `접속 코드(kwon) 통과 후`, 각 사용자는 본인 e-khnp 계정으로 로그인합니다.
+
+동시 처리 부하 점검(운영값 5 기준):
+
+```bash
+source .venv/bin/activate
+python scripts/queue_load_check.py --workers 5 --jobs 15 --sleep-sec 1.2 \
+  --report-path logs/queue_load_report.json
+```
+
+연속 우회 이력 영속/다음 강좌 선택 점검:
+
+```bash
+source .venv/bin/activate
+python scripts/deferred_course_history_check.py \
+  --report-path logs/deferred_course_history_check.json
+```
 
 `APP_ACCESS_CODE_HASH` 생성 예시:
 
@@ -306,6 +323,8 @@ RAG_WEB_TOP_N=4
 RAG_WEB_TIMEOUT_SEC=8
 RAG_WEB_WEIGHT=0.35
 EXAM_ANSWER_BANK_PATH=rag/exam_answer_bank.json
+EXAM_DEFERRED_COURSES_PATH=.runtime/deferred_exam_courses.json
+EXAM_QUALITY_REPORT_DIR=logs/exam_quality_reports
 EXAM_AUTO_RETRY_MAX=2
 EXAM_RETRY_REQUIRES_ANSWER_INDEX=true
 EXAM_RETRY_NO_IMPROVE_LIMIT=2
@@ -332,6 +351,8 @@ COMPLETION_MAX_COURSES=20
 - 웹 검색은 DuckDuckGo HTML 결과를 사용합니다(인터넷 연결 필요).
 - `RAG_WEB_WEIGHT`는 로컬 RAG 점수와 웹 검색 점수 결합 비율입니다.
 - 점수 미달 시 결과지(`item result`)에서 정답을 추출해 `EXAM_ANSWER_BANK_PATH` 인덱스에 저장합니다.
+- 우회 강좌 이력은 `EXAM_DEFERRED_COURSES_PATH`에 저장되어 재시작 후에도 유지됩니다.
+- 시험 결과 파싱 품질 리포트(문항별 근거/신뢰도/정오)는 `EXAM_QUALITY_REPORT_DIR`에 JSON으로 저장됩니다.
 - 인덱스된 정답은 다음 응시에서 RAG보다 우선 적용됩니다.
 - `EXAM_AUTO_RETRY_MAX` 범위 내에서 자동 재응시를 수행합니다.
 - `EXAM_RETRY_REQUIRES_ANSWER_INDEX=true`면 정답 인덱싱 실패 시 재응시를 중단합니다.

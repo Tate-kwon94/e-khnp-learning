@@ -85,11 +85,22 @@ class TaskQueueManager:
         )
         with self._lock:
             pending_or_running = sum(1 for j in self._jobs.values() if j.status in {"pending", "running"})
+            running_now = sum(1 for j in self._jobs.values() if j.status == "running")
+            pending_now = sum(1 for j in self._jobs.values() if j.status == "pending")
             if pending_or_running >= self.max_pending:
                 raise QueueCapacityError(
                     f"큐 대기 한도 초과: 현재 {pending_or_running}개, 한도 {self.max_pending}개"
                 )
             self._prune_jobs_unlocked()
+            now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            if running_now >= self.worker_count:
+                job.logs.append(
+                    f"[{now_iso}] 대기열 등록: 실행 슬롯 사용중({running_now}/{self.worker_count}), 대기 {pending_now + 1}건"
+                )
+            else:
+                job.logs.append(
+                    f"[{now_iso}] 즉시 실행 대기: 실행 슬롯 여유({running_now}/{self.worker_count})"
+                )
             self._jobs[job_id] = job
         self._queue.put((job_id, runner))
         return job_id
