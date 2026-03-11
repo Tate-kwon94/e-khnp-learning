@@ -674,6 +674,29 @@ def _render_queue_status(
     return has_active_jobs
 
 
+@st.fragment(run_every="1s")
+def _render_live_queue_and_logs_fragment(
+    queue_manager: TaskQueueManager,
+    *,
+    owner: str | None,
+    compact: bool,
+    is_admin: bool,
+) -> None:
+    has_active_jobs = _render_queue_status(
+        queue_manager,
+        owner=owner,
+        compact=compact,
+        is_admin=is_admin,
+    )
+    st.subheader("실행 로그")
+    recent_logs = list(st.session_state.logs[-500:]) if st.session_state.logs else []
+    _render_scrollable_log_block(recent_logs, height_px=260, empty_text="(아직 로그 없음)")
+    if has_active_jobs:
+        st.caption("실시간 로그 업데이트: ON")
+    else:
+        st.caption("실시간 로그 업데이트: IDLE")
+
+
 def main() -> None:
     st.set_page_config(page_title="e-KHNP Automation", layout="wide")
     st.title("e-KHNP Automation (Prototype)")
@@ -838,37 +861,65 @@ def main() -> None:
 
     if is_admin:
         st.subheader("마일스톤 진행 현황")
-        milestone_cols = st.columns(5)
-        with milestone_cols[0]:
-            st.metric(
+        milestones = [
+            (
                 "M1 프로젝트 골격",
                 "100%",
-                help="기본 파일 구조, 설정 로딩, Streamlit 실행 뼈대 완료",
-            )
-        with milestone_cols[1]:
-            st.metric(
+                "기본 파일 구조, 설정 로딩, Streamlit 실행 뼈대 완료",
+            ),
+            (
                 "M2 로그인 자동화",
                 "99%",
-                help="로그인 선택자 보정 및 성공/실패 판정 로직 완료",
-            )
-        with milestone_cols[2]:
-            st.metric(
+                "로그인 선택자 보정 및 성공/실패 판정 로직 완료",
+            ),
+            (
                 "M3 학습현황·첫과목 진입",
                 "97%",
-                help="나의 학습현황 이동 + 수강과정 첫 행 학습하기 클릭/강의실 진입 확인",
-            )
-        with milestone_cols[3]:
-            st.metric(
+                "나의 학습현황 이동 + 수강과정 첫 행 학습하기 클릭/강의실 진입 확인",
+            ),
+            (
                 "M4 강의 재생·완료처리",
                 "96%",
-                help="차시 진행률 판독 + 파란색 완료 확인 + 우하단 Next로 다음 차시 반복 처리",
-            )
-        with milestone_cols[4]:
-            st.metric(
+                "차시 진행률 판독 + 파란색 완료 확인 + 우하단 Next로 다음 차시 반복 처리",
+            ),
+            (
                 "M5 수료 순서 자동화",
                 "95%",
-                help="원클릭 실행 + 진도율→학습시간→시험 + 계정 동기화(Enter/버튼) 후 Start 분리 + 시험 우회/재응시/인덱싱 고도화",
-            )
+                "원클릭 실행 + 진도율→학습시간→시험 + 계정 동기화 후 Start 분리 + 시험 우회/재응시/인덱싱 고도화",
+            ),
+            (
+                "M6 종합평가 안정화",
+                "96%",
+                "문항 추출/제출/재응시/응시횟수 보호 및 결과 판독 안정화",
+            ),
+            (
+                "M7 RAG 풀이 고도화",
+                "96%",
+                "문항 정규화/보기 순서 불변 매칭 + 오답 근거 전환 + 품질 리포트",
+            ),
+            (
+                "M8 원격 실행 서버화",
+                "90%",
+                "Streamlit user/admin 분리 + LaunchAgent + Tunnel 운영 안정화",
+            ),
+            (
+                "M9 동시성/대기열",
+                "96%",
+                "APP_WORKER_COUNT=5 기준 동시 처리 + 초과 pending + 중복 실행 차단",
+            ),
+            (
+                "M10 운영/복구",
+                "90%",
+                "작업 스냅샷 영속 + 계정별 로그/현황 + 실패 재시도/디버그 산출물 강화",
+            ),
+        ]
+        row_size = 5
+        for start in range(0, len(milestones), row_size):
+            cols = st.columns(row_size)
+            chunk = milestones[start : start + row_size]
+            for col, (title, value, help_text) in zip(cols, chunk):
+                with col:
+                    st.metric(title, value, help=help_text)
         st.progress(0.99, text="전체 진행률 99%")
         st.caption("운영 실시간 현황")
         owner_rows = queue_manager.owner_stats()
@@ -894,25 +945,43 @@ def main() -> None:
         st.session_state.account_user_password_input = settings.user_password
 
     st.subheader("계정 동기화")
-    with st.form("account_sync_form", clear_on_submit=False):
-        input_col1, input_col2 = st.columns(2)
-        with input_col1:
-            st.text_input(
-                "아이디",
-                key="account_user_id_input",
-                placeholder="사번 또는 아이디",
-                autocomplete="username",
-            )
-        with input_col2:
-            st.text_input(
-                "비밀번호",
-                key="account_user_password_input",
-                type="password",
-                placeholder="비밀번호",
-                autocomplete="current-password",
-            )
-        st.caption("Enter 또는 로그인/동기화 버튼으로 계정을 동기화한 뒤 Start를 눌러주세요.")
-        login_sync_clicked = st.form_submit_button("로그인/동기화", type="primary", width='stretch')
+    sync_col, algo_col = st.columns([2, 1])
+    with sync_col:
+        with st.form("account_sync_form", clear_on_submit=False):
+            input_col1, input_col2 = st.columns(2)
+            with input_col1:
+                st.text_input(
+                    "아이디",
+                    key="account_user_id_input",
+                    placeholder="사번 또는 아이디",
+                    autocomplete="username",
+                )
+            with input_col2:
+                st.text_input(
+                    "비밀번호",
+                    key="account_user_password_input",
+                    type="password",
+                    placeholder="비밀번호",
+                    autocomplete="current-password",
+                )
+            st.caption("Enter 또는 로그인/동기화 버튼으로 계정을 동기화한 뒤 Start를 눌러주세요.")
+            login_sync_clicked = st.form_submit_button("로그인/동기화", type="primary", width='stretch')
+    with algo_col:
+        st.caption("실행 알고리즘(간단)")
+        st.code(
+            (
+                "[1] ID/PW 입력\n"
+                "   -> Enter 또는 로그인/동기화\n"
+                "[2] 계정 기준 기존 작업 동기화\n"
+                "   -> running/pending 있으면 이어서 모니터링\n"
+                "   -> 없으면 START 대기\n"
+                "[3] START 클릭\n"
+                "   -> 동일 계정 활성 작업 있으면 중복 차단\n"
+                "[4] 큐 등록 -> 워커 실행\n"
+                "[5] 작업 로그/상태 실시간 반영"
+            ),
+            language="text",
+        )
 
     current_user_id_input = str(st.session_state.get("account_user_id_input", "")).strip()
     current_user_password_input = str(st.session_state.get("account_user_password_input", ""))
@@ -1369,16 +1438,12 @@ def main() -> None:
         if job_id:
             st.info(f"작업이 큐에 등록되었습니다. id={job_id}")
 
-    has_active_jobs = _render_queue_status(
+    _render_live_queue_and_logs_fragment(
         queue_manager,
         owner=None if is_admin else queue_owner_key,
         compact=not is_admin,
         is_admin=is_admin,
     )
-
-    st.subheader("실행 로그")
-    recent_logs = list(st.session_state.logs[-500:]) if st.session_state.logs else []
-    _render_scrollable_log_block(recent_logs, height_px=260, empty_text="(아직 로그 없음)")
 
 if __name__ == "__main__":
     main()
