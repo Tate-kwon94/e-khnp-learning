@@ -748,6 +748,12 @@ def _render_system_flow_diagram(start_label: str) -> None:
             "<div style='margin-top:8px; color:#555; font-size:12px;'>"
             "중복 실행 감지 시 새 작업은 차단되고, 기존 작업 상태 화면으로 자동 이동합니다."
             "</div>"
+            "<div style='margin-top:6px; color:#777; font-size:10px; line-height:1.35;'>"
+            "미구현(작게 표시): "
+            "① 예상 대기시간(ETA) 자동 계산, "
+            "② 브라우저 강제 종료 후 체크포인트 기반 자동 재개, "
+            "③ FastAPI/Redis 분산 큐 전환"
+            "</div>"
             "</div>"
         ),
         unsafe_allow_html=True,
