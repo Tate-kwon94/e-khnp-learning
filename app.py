@@ -363,7 +363,7 @@ def _enqueue_job(
                 "동일 계정에서 이미 실행 중인 작업이 있습니다. "
                 f"기존 작업을 확인하세요. id={active_job_id} / status={active_status}"
             )
-            return active_job_id
+            return None
         st.warning("동일 계정에서 이미 실행 중인 작업이 있어 신규 등록을 차단했습니다.")
         return None
 
