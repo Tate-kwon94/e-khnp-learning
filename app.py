@@ -759,15 +759,46 @@ flowchart TB
   class J,P,Q,R run;
 """
     mermaid_html = f"""
-<div style="border:1px solid #d9d9d9; border-radius:8px; padding:6px; background:#fafafa;">
+<style>
+  .mermaid-wrap {{
+    border: 1px solid #d9d9d9;
+    border-radius: 8px;
+    padding: 6px;
+    background: #fafafa;
+    overflow-x: auto;
+  }}
+  .mermaid-wrap .mermaid {{
+    text-align: center;
+    font-size: 12px;
+  }}
+  .mermaid-wrap svg {{
+    margin-left: auto;
+    margin-right: auto;
+    display: block;
+    max-width: 900px;
+    width: 100%;
+    height: auto;
+  }}
+</style>
+<div class="mermaid-wrap">
   <pre class="mermaid">{html.escape(mermaid_code)}</pre>
 </div>
 <script type="module">
   import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
-  mermaid.initialize({{ startOnLoad: true, securityLevel: "loose", theme: "default" }});
+  mermaid.initialize({{
+    startOnLoad: true,
+    securityLevel: "loose",
+    theme: "default",
+    themeVariables: {{
+      fontSize: "12px"
+    }},
+    flowchart: {{
+      useMaxWidth: true
+    }}
+  }});
 </script>
 """
-    components.html(mermaid_html, height=1280, scrolling=True)
+    components.html(mermaid_html, height=980, scrolling=True)
 
 
 def main() -> None:
