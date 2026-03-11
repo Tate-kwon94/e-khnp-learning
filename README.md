@@ -2,10 +2,12 @@
 
 Playwright + Streamlit 기반 e-khnp 수강 자동화 도구입니다.
 
-## 0) 현재 상태 (2026-03-10)
+## 0) 현재 상태 (2026-03-11)
 
 - 원클릭 실행 지원: `인덱스 확인(필요 시 생성) → 수료 자동 워크플로우` 단일 버튼 실행
 - 수료 루프: 한 과정 수료 후 `나의 학습현황 > 수강과정`에서 다음 과정 자동 진입 반복
+- 사용자 계정 동기화 흐름: `ID/PW 입력 + Enter(또는 로그인/동기화)` 후 `START` 실행으로 분리
+- 재접속 복구: 브라우저 종료/세션 만료 후에도 같은 계정 동기화 시 기존 큐 상태 즉시 조회
 - 종합평가 예외 처리:
   - 시험평가 수료기준이 공란/`-`인 과정은 시험 자동 생략
   - 각 강의당 마지막 1회 응시는 보존(`EXAM_ATTEMPT_RESERVE=1`)
@@ -13,6 +15,8 @@ Playwright + Streamlit 기반 e-khnp 수강 자동화 도구입니다.
 - 시간보충 안정화:
   - `학습 진행현황` 버튼 미탐지 시 `학습 차시 1차시 학습하기` 직접 진입 fallback
   - 학습시간 부족 체크 주기 동적화(남은 시간 기준 3~10분)
+- OCR 폴백 활성화 완료: 서버에 `tesseract + kor` 데이터 설치 후 문항 OCR 경로 정상화
+- RAG 안정화: 저신뢰도 경계값(0.55) 비교 보정 + LLM JSON 파싱 관용성 강화
 - 2026-03-10 실주행 확인:
   - 원클릭 경로에서 `학습시간 보충용 학습창` 팝업 진입 성공
   - 학습시간 `00:05:08 -> 00:14:22` 증가 확인
@@ -55,12 +59,17 @@ Playwright + Streamlit 기반 e-khnp 수강 자동화 도구입니다.
 - M2 로그인/포털 이동 자동화: `99%`
 - M3 강의실 진입/학습차시 탐색: `97%`
 - M4 학습 재생/차시 완료 루프: `96%`
-- M5 수료 순서 자동화(진도→시간→시험): `92%`
+- M5 수료 순서 자동화(진도→시간→시험): `95%`
+- M6 종합평가 자동화 안정화: `96%`
+- M7 LLM(RAG) 기반 시험풀이 고도화: `96%`
+- M8 원격 실행 서버화(Streamlit+Tunnel+Worker): `90%`
+- M9 동시성 제어(최대 5명)+대기열: `96%`
+- M10 운영(로그/모니터링/복구): `90%`
 
 ## 1) macOS(집 맥미니) 실행
 
 ```bash
-cd "/Users/maegbug-eeo/Documents/New project/e-khnp automation project"
+cd "/Users/maegbug-eeo/Documents/New project 2"
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -133,7 +142,7 @@ streamlit run app.py
 최초 1회(현재 프로젝트 폴더에서):
 
 ```bash
-cd "/Users/maegbug-eeo/Documents/New project/e-khnp automation project"
+cd "/Users/maegbug-eeo/Documents/New project 2"
 git init
 git add .
 git commit -m "init: e-khnp automation"
@@ -346,7 +355,7 @@ COMPLETION_MAX_COURSES=20
 - 신뢰도 미달 시 재질문 1회를 추가 시도합니다.
 - 기본 신뢰도 임계치는 `0.65`(80점 운용 기준에서 안전 마진)이며 필요 시 조정하세요.
 - 보수 운용 기준은 `RAG_PASS_SCORE=80`으로 설정되어 저신뢰 문항 허용량을 자동 제한합니다.
-- 시험 문항 DOM 추출 실패 시 OCR 폴백을 시도합니다. (`tesseract` 설치 시 활성)
+- 시험 문항 DOM 추출 실패 시 OCR 폴백을 시도합니다. (현재 운영 서버는 `tesseract + kor` 설치로 활성 상태)
 - Ollama가 실행 중이 아니면 인덱싱/풀이가 실패합니다.
 - `EXAM_ATTEMPT_RESERVE=1`이면 각 강의당 마지막 1회 응시는 자동화에서 남겨둡니다.
 - 문항 풀이 시 웹 검색은 항상 참조되도록 고정되어 있습니다.

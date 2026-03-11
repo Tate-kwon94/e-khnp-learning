@@ -866,10 +866,10 @@ def main() -> None:
         with milestone_cols[4]:
             st.metric(
                 "M5 수료 순서 자동화",
-                "92%",
-                help="원클릭 실행 + 진도율→시험평가→학습시간 보충 + 1차시 직접진입/동적시간체크 + 시험없음/응시보존/정답지 인덱싱 재응시",
+                "95%",
+                help="원클릭 실행 + 진도율→학습시간→시험 + 계정 동기화(Enter/버튼) 후 Start 분리 + 시험 우회/재응시/인덱싱 고도화",
             )
-        st.progress(0.98, text="전체 진행률 98%")
+        st.progress(0.99, text="전체 진행률 99%")
         st.caption("운영 실시간 현황")
         owner_rows = queue_manager.owner_stats()
         active_owner_count = sum(
