@@ -272,15 +272,6 @@ def _account_owner_label(user_id: str, fallback_viewer_id: str) -> str:
     return f"anonymous-{fallback_viewer_id[:6]}"
 
 
-def _consume_new_job_logs(job_id: str, logs: list[str]) -> list[str]:
-    cursor_map = st.session_state.setdefault("job_log_cursor", {})
-    previous = int(cursor_map.get(job_id, 0))
-    previous = max(0, min(previous, len(logs)))
-    new_lines = logs[previous:]
-    cursor_map[job_id] = len(logs)
-    return new_lines
-
-
 def _build_task_settings(
     *,
     user_id_input: str,
@@ -592,14 +583,8 @@ def _render_queue_status(
             st.success(f"재시도 작업을 등록했습니다. id={retry_job_id}")
 
     def _render_job_logs(job: dict[str, Any], *, key_suffix: str, height_px: int) -> None:
-        job_id = str(job.get("job_id", ""))
         logs = list(job.get("logs") or [])
-        new_lines = _consume_new_job_logs(job_id, logs)
-        if new_lines:
-            st.caption(f"새 로그 {len(new_lines)}줄")
-            _render_scrollable_log_block(new_lines[-120:], height_px=150, empty_text="(새 로그 없음)")
-        recent_only = st.checkbox("최근 로그만 보기", value=True, key=f"recent_logs_{key_suffix}")
-        lines_for_view = logs[-300:] if recent_only else logs
+        lines_for_view = logs[-8:]
         _render_scrollable_log_block(lines_for_view, height_px=height_px, empty_text="(작업 로그 없음)")
 
     if compact:
@@ -725,13 +710,20 @@ def main() -> None:
     if access_enabled and not st.session_state.access_granted:
         st.subheader("접속 코드")
         _, lock_remaining = _read_access_guard(now_ts)
-        access_code_input = st.text_input(
-            "접속 코드 입력",
-            type="password",
-            placeholder="관리자에게 문의하세요",
-            disabled=lock_remaining > 0,
-        )
-        if st.button("입장", type="primary", width='stretch', disabled=lock_remaining > 0):
+        with st.form("access_code_form"):
+            access_code_input = st.text_input(
+                "접속 코드 입력",
+                type="password",
+                placeholder="관리자에게 문의하세요",
+                disabled=lock_remaining > 0,
+            )
+            submit_access = st.form_submit_button(
+                "입장",
+                type="primary",
+                width='stretch',
+                disabled=lock_remaining > 0,
+            )
+        if submit_access:
             if _verify_access_code(access_code_input, settings):
                 st.session_state.access_granted = True
                 st.session_state.access_auth_ts = now_ts
@@ -771,8 +763,6 @@ def main() -> None:
     force_ui_role = settings.app_force_ui_role if settings.app_force_ui_role in {"user", "admin"} else ""
     if "viewer_id" not in st.session_state:
         st.session_state.viewer_id = uuid.uuid4().hex
-    if "job_log_cursor" not in st.session_state:
-        st.session_state.job_log_cursor = {}
     if "ui_role" not in st.session_state:
         st.session_state.ui_role = default_ui_role
     if "admin_unlocked" not in st.session_state:
@@ -1308,14 +1298,6 @@ def main() -> None:
     st.subheader("실행 로그")
     recent_logs = list(st.session_state.logs[-500:]) if st.session_state.logs else []
     _render_scrollable_log_block(recent_logs, height_px=260, empty_text="(아직 로그 없음)")
-
-    auto_refresh_default = not is_admin
-    auto_refresh = st.checkbox("작업 상태 자동 업데이트(5초)", value=auto_refresh_default)
-    if auto_refresh and has_active_jobs:
-        st.caption("작업 진행 중 상태를 반영하기 위해 5초마다 자동 새로고침합니다.")
-        time.sleep(5)
-        st.rerun()
-
 
 if __name__ == "__main__":
     main()

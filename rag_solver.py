@@ -29,52 +29,121 @@ def _is_safe_http_url(url: str) -> bool:
 
 class OllamaClient:
     def __init__(self, base_url: str = "http://127.0.0.1:11434") -> None:
-        self.base_url = base_url.rstrip("/")
+        normalized = base_url.rstrip("/")
+        if normalized.endswith("/v1"):
+            normalized = normalized[:-3].rstrip("/")
+        self.base_url = normalized
         if not _is_safe_http_url(self.base_url):
             raise ValueError(f"Ollama base URL must be http/https: {base_url}")
 
-    def embed(self, model: str, text: str) -> list[float]:
-        payload = {"model": model, "prompt": text}
+    def _request_json(
+        self,
+        *,
+        path: str,
+        payload: dict[str, Any],
+        timeout: int,
+        allow_404: bool = False,
+    ) -> dict[str, Any] | None:
         data = json.dumps(payload).encode("utf-8")
         req = request.Request(
-            f"{self.base_url}/api/embeddings",
+            f"{self.base_url}{path}",
             data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=120) as resp:  # noqa: S310  # nosec B310
-                body = json.loads(resp.read().decode("utf-8"))
+            with request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310
+                return json.loads(resp.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="ignore").strip()
+            except Exception:  # noqa: BLE001
+                body = ""
+            if allow_404 and int(getattr(exc, "code", 0)) == 404:
+                return None
+            detail = f"HTTP {getattr(exc, 'code', '?')} {getattr(exc, 'reason', '')}".strip()
+            if body:
+                detail += f" / body={body[:240]}"
+            raise RuntimeError(f"Ollama API call failed ({path}): {detail}") from exc
         except error.URLError as exc:
-            raise RuntimeError(f"Ollama embedding call failed: {exc}") from exc
-        emb = body.get("embedding")
-        if not isinstance(emb, list) or not emb:
-            raise RuntimeError("Invalid embedding response from Ollama")
-        return [float(x) for x in emb]
+            raise RuntimeError(f"Ollama API call failed ({path}): {exc}") from exc
+
+    @staticmethod
+    def _model_candidates(model: str) -> list[str]:
+        src = str(model or "").strip()
+        if not src:
+            return []
+        out = [src]
+        lowered = src.lower()
+        if "-instruct" in lowered:
+            out.append(src.replace("-instruct", ""))
+        if ":" in src:
+            head, tail = src.split(":", 1)
+            if "-instruct" in tail:
+                out.append(f"{head}:{tail.replace('-instruct', '')}")
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for item in out:
+            key = item.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(key)
+        return deduped
+
+    def embed(self, model: str, text: str) -> list[float]:
+        primary_payload = {"model": model, "prompt": text}
+        body = self._request_json(path="/api/embeddings", payload=primary_payload, timeout=120, allow_404=True)
+        if isinstance(body, dict):
+            emb = body.get("embedding")
+            if isinstance(emb, list) and emb:
+                return [float(x) for x in emb]
+
+        # Newer/alternate Ollama route
+        fallback_payload = {"model": model, "input": text}
+        fb = self._request_json(path="/api/embed", payload=fallback_payload, timeout=120, allow_404=False)
+        embeddings = fb.get("embeddings") if isinstance(fb, dict) else None
+        if isinstance(embeddings, list) and embeddings and isinstance(embeddings[0], list):
+            return [float(x) for x in embeddings[0]]
+        raise RuntimeError("Invalid embedding response from Ollama (/api/embeddings, /api/embed 모두 실패)")
 
     def generate(self, model: str, prompt: str, temperature: float = 0.1) -> str:
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": temperature},
-        }
-        data = json.dumps(payload).encode("utf-8")
-        req = request.Request(
-            f"{self.base_url}/api/generate",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        tried_models: list[str] = []
+        for candidate_model in self._model_candidates(model):
+            tried_models.append(candidate_model)
+            payload = {
+                "model": candidate_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": temperature},
+            }
+            body = self._request_json(path="/api/generate", payload=payload, timeout=180, allow_404=True)
+            if isinstance(body, dict):
+                txt = body.get("response")
+                if isinstance(txt, str) and txt.strip():
+                    return txt
+
+            # Fallback for environments exposing chat-style generation
+            chat_payload = {
+                "model": candidate_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "options": {"temperature": temperature},
+            }
+            chat = self._request_json(path="/api/chat", payload=chat_payload, timeout=180, allow_404=True)
+            if isinstance(chat, dict):
+                msg = chat.get("message")
+                if isinstance(msg, dict):
+                    txt = msg.get("content")
+                    if isinstance(txt, str) and txt.strip():
+                        return txt
+
+        tried = ", ".join(tried_models) if tried_models else str(model)
+        raise RuntimeError(
+            "Invalid generate response from Ollama "
+            f"(/api/generate, /api/chat 모두 실패, tried_models=[{tried}])"
         )
-        try:
-            with request.urlopen(req, timeout=180) as resp:  # noqa: S310  # nosec B310
-                body = json.loads(resp.read().decode("utf-8"))
-        except error.URLError as exc:
-            raise RuntimeError(f"Ollama generate call failed: {exc}") from exc
-        txt = body.get("response")
-        if not isinstance(txt, str) or not txt.strip():
-            raise RuntimeError("Invalid generate response from Ollama")
-        return txt
 
 
 class RagExamSolver:

@@ -248,6 +248,9 @@ class TaskQueueManager:
                     result = {"message": str(result), "success": True}
                 if "success" not in result:
                     result["success"] = True
+                if not bool(result.get("success", True)):
+                    message = str(result.get("message", "작업 실패")).strip() or "작업 실패"
+                    raise RuntimeError(message)
                 self._set_finished(job_id, result=result)
             except Exception as exc:  # noqa: BLE001
                 tb = traceback.format_exc()

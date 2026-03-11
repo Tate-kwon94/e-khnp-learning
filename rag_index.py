@@ -108,28 +108,68 @@ def _is_safe_http_url(url: str) -> bool:
 
 class OllamaClient:
     def __init__(self, base_url: str = "http://127.0.0.1:11434") -> None:
-        self.base_url = base_url.rstrip("/")
+        normalized = base_url.rstrip("/")
+        if normalized.endswith("/v1"):
+            normalized = normalized[:-3].rstrip("/")
+        self.base_url = normalized
         if not _is_safe_http_url(self.base_url):
             raise ValueError(f"Ollama base URL must be http/https: {base_url}")
 
-    def embed(self, model: str, text: str) -> list[float]:
-        payload = {"model": model, "prompt": text}
+    def _request_json(
+        self,
+        *,
+        path: str,
+        payload: dict[str, object],
+        timeout: int,
+        allow_404: bool = False,
+    ) -> dict[str, object] | None:
         data = json.dumps(payload).encode("utf-8")
         req = request.Request(
-            f"{self.base_url}/api/embeddings",
+            f"{self.base_url}{path}",
             data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=120) as resp:  # noqa: S310  # nosec B310
-                body = json.loads(resp.read().decode("utf-8"))
+            with request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310
+                return json.loads(resp.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="ignore").strip()
+            except Exception:  # noqa: BLE001
+                body = ""
+            if allow_404 and int(getattr(exc, "code", 0)) == 404:
+                return None
+            detail = f"HTTP {getattr(exc, 'code', '?')} {getattr(exc, 'reason', '')}".strip()
+            if body:
+                detail += f" / body={body[:240]}"
+            raise RuntimeError(f"Ollama embedding call failed ({path}): {detail}") from exc
         except error.URLError as exc:
-            raise RuntimeError(f"Ollama embedding call failed: {exc}") from exc
-        emb = body.get("embedding")
-        if not isinstance(emb, list) or not emb:
-            raise RuntimeError("Invalid embedding response from Ollama")
-        return [float(x) for x in emb]
+            raise RuntimeError(f"Ollama embedding call failed ({path}): {exc}") from exc
+
+    def embed(self, model: str, text: str) -> list[float]:
+        primary = self._request_json(
+            path="/api/embeddings",
+            payload={"model": model, "prompt": text},
+            timeout=120,
+            allow_404=True,
+        )
+        if isinstance(primary, dict):
+            emb = primary.get("embedding")
+            if isinstance(emb, list) and emb:
+                return [float(x) for x in emb]
+
+        fallback = self._request_json(
+            path="/api/embed",
+            payload={"model": model, "input": text},
+            timeout=120,
+            allow_404=False,
+        )
+        embeddings = fallback.get("embeddings") if isinstance(fallback, dict) else None
+        if isinstance(embeddings, list) and embeddings and isinstance(embeddings[0], list):
+            return [float(x) for x in embeddings[0]]
+        raise RuntimeError("Invalid embedding response from Ollama (/api/embeddings, /api/embed 모두 실패)")
 
 
 def _chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> list[str]:

@@ -4533,6 +4533,9 @@ class EKHNPAutomator:
             if self._click_first_visible(scope, selectors, max_items=20):
                 page.wait_for_timeout(900)
                 return True
+            if self._click_next_arrow_like(scope):
+                page.wait_for_timeout(900)
+                return True
 
         # 현재 문항 번호를 알고 있으면 해당 문항의 next 핸들러를 우선 실행합니다.
         if current > 0:
@@ -4640,7 +4643,103 @@ class EKHNPAutomator:
                     return True
             except Exception:  # noqa: BLE001
                 pass
+            if self._click_next_arrow_like(scope):
+                page.wait_for_timeout(900)
+                return True
         return False
+
+    @staticmethod
+    def _click_next_arrow_like(scope: Any) -> bool:
+        try:
+            return bool(
+                scope.evaluate(
+                    """
+                    () => {
+                      const normalize = (v) => String(v || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                      const isVisible = (el) => {
+                        if (!el || !el.getBoundingClientRect) return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                      };
+                      const isInteractive = (el) => {
+                        if (!el) return false;
+                        const tag = (el.tagName || '').toLowerCase();
+                        if (['a', 'button', 'input', 'summary'].includes(tag)) return true;
+                        if (el.getAttribute('role') === 'button') return true;
+                        if (el.hasAttribute('onclick')) return true;
+                        if ((el.getAttribute('href') || '').length > 0) return true;
+                        if ((el.getAttribute('tabindex') || '').length > 0) return true;
+                        return false;
+                      };
+                      const pickTarget = (el) => (
+                        el.closest('a,button,input,[role="button"],[onclick],.next,.nextPage,.btn_next,#nextBtn,[tabindex]')
+                        || el
+                      );
+
+                      const nodes = Array.from(document.querySelectorAll('a,button,input,div,span,i,img,svg,use'));
+                      const keywords = ['다음', 'next', 'arrow', 'right', 'nextpage', 'btn_next', 'donext'];
+                      let best = null;
+                      const vw = Math.max(window.innerWidth || 0, document.documentElement.clientWidth || 0);
+                      const vh = Math.max(window.innerHeight || 0, document.documentElement.clientHeight || 0);
+
+                      for (const n of nodes) {
+                        if (!isVisible(n)) continue;
+                        const target = pickTarget(n);
+                        if (!isVisible(target)) continue;
+
+                        const attrs = [
+                          n.textContent,
+                          n.getAttribute && n.getAttribute('alt'),
+                          n.getAttribute && n.getAttribute('title'),
+                          n.getAttribute && n.getAttribute('aria-label'),
+                          n.getAttribute && n.getAttribute('src'),
+                          n.getAttribute && n.getAttribute('class'),
+                          n.getAttribute && n.getAttribute('id'),
+                          target.textContent,
+                          target.getAttribute && target.getAttribute('alt'),
+                          target.getAttribute && target.getAttribute('title'),
+                          target.getAttribute && target.getAttribute('aria-label'),
+                          target.getAttribute && target.getAttribute('src'),
+                          target.getAttribute && target.getAttribute('class'),
+                          target.getAttribute && target.getAttribute('id'),
+                          target.getAttribute && target.getAttribute('onclick'),
+                          target.getAttribute && target.getAttribute('href'),
+                        ].map(normalize).join(' ');
+
+                        let score = 0;
+                        if (keywords.some((k) => attrs.includes(k))) score += 90;
+                        if (
+                          attrs.includes('>') || attrs.includes('›') || attrs.includes('＞')
+                          || attrs.includes('→') || attrs.includes('chevron-right') || attrs.includes('arrow-right')
+                        ) {
+                          score += 35;
+                        }
+                        if (attrs.includes('donextshowitem') || attrs.includes('nextindex')) score += 35;
+                        if ((n.tagName || '').toLowerCase() === 'img' || (n.tagName || '').toLowerCase() === 'svg') score += 8;
+
+                        const r = target.getBoundingClientRect();
+                        if (vw > 0 && (r.left + r.width * 0.5) >= vw * 0.55) score += 8;
+                        if (vh > 0 && (r.top + r.height * 0.5) >= vh * 0.35) score += 6;
+
+                        if (!isInteractive(target) && score < 100) continue;
+                        if (!best || score > best.score) best = { target, score };
+                      }
+
+                      if (!best || best.score < 35) return false;
+                      const el = best.target;
+                      try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) {}
+                      try { el.click(); return true; } catch (e) {}
+                      try {
+                        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                        return true;
+                      } catch (e) {}
+                      return false;
+                    }
+                    """
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     def _click_exam_option(
         self, page: Page, choice: int, options: Optional[list[str]] = None, current: int = 0
@@ -6463,6 +6562,9 @@ class EKHNPAutomator:
             if self._click_first_visible(scope, selectors, max_items=25):
                 page.wait_for_timeout(600)
                 return True
+            if self._click_next_arrow_like(scope):
+                page.wait_for_timeout(600)
+                return True
 
             # 하단 네비게이션 우측 "다음" 텍스트를 직접 찾는 폴백
             clicked = scope.evaluate(
@@ -6500,6 +6602,9 @@ class EKHNPAutomator:
                 """
             )
             if clicked:
+                page.wait_for_timeout(600)
+                return True
+            if self._click_next_arrow_like(scope):
                 page.wait_for_timeout(600)
                 return True
         return False
@@ -6653,6 +6758,8 @@ class EKHNPAutomator:
             'a[onclick*="doNext"]',
         ]
         clicked = self._click_first_visible(page, selectors, max_items=10)
+        if not clicked:
+            clicked = self._click_next_arrow_like(page)
         if clicked:
             self._log("우하단 '다음 ( Next )' 버튼 클릭 완료")
             page.wait_for_timeout(1200)

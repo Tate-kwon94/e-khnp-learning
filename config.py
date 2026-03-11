@@ -53,7 +53,7 @@ class Settings:
     rag_docs_dir: str = os.getenv("RAG_DOCS_DIR", "rag_data")
     rag_index_path: str = os.getenv("RAG_INDEX_PATH", "rag/index.json")
     rag_embed_model: str = os.getenv("RAG_EMBED_MODEL", "nomic-embed-text")
-    rag_generate_model: str = os.getenv("RAG_GENERATE_MODEL", "qwen2.5:7b-instruct")
+    rag_generate_model: str = os.getenv("RAG_GENERATE_MODEL", "qwen2.5:7b")
     rag_top_k: int = int(os.getenv("RAG_TOP_K", "6"))
     rag_conf_threshold: float = float(os.getenv("RAG_CONF_THRESHOLD", "0.65"))
     rag_chunk_size: int = int(os.getenv("RAG_CHUNK_SIZE", "900"))

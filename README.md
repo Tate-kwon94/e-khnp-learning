@@ -299,7 +299,7 @@ cloudflared tunnel run khnp-app
 ```bash
 # Ollama 설치 후 모델 받기
 ollama pull nomic-embed-text
-ollama pull qwen2.5:7b-instruct
+ollama pull qwen2.5:7b
 ```
 
 `.env` 예시:
@@ -309,7 +309,7 @@ OLLAMA_BASE_URL=http://127.0.0.1:11434
 RAG_DOCS_DIR=rag_data
 RAG_INDEX_PATH=rag/index.json
 RAG_EMBED_MODEL=nomic-embed-text
-RAG_GENERATE_MODEL=qwen2.5:7b-instruct
+RAG_GENERATE_MODEL=qwen2.5:7b
 RAG_TOP_K=6
 RAG_CONF_THRESHOLD=0.65
 RAG_CHUNK_SIZE=900
