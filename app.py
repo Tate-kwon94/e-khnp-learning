@@ -1292,7 +1292,13 @@ def main() -> None:
         width='stretch',
         disabled=one_click_disabled,
     )
-    _render_system_flow_diagram(one_click_button_label)
+    show_flow = st.toggle(
+        "실행 알고리즘 보기",
+        value=False,
+        help="데스크톱/모바일 모두 이 토글을 켜면 START 이후 전체 자동화 흐름도를 확인할 수 있습니다.",
+    )
+    if show_flow:
+        _render_system_flow_diagram(one_click_button_label)
 
     run_login = False
     run_learning_status = False
