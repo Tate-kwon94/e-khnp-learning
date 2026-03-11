@@ -697,6 +697,57 @@ def _render_live_queue_and_logs_fragment(
         st.caption("실시간 로그 업데이트: IDLE")
 
 
+def _render_system_flow_diagram(start_label: str) -> None:
+    st.caption("시스템 전체 동작도")
+    st.markdown(
+        (
+            "<div style='border:1px solid #d9d9d9; border-radius:8px; padding:10px; background:#fafafa;'>"
+            "<div style='display:flex; flex-wrap:wrap; align-items:center; gap:8px;'>"
+            "<div style='padding:8px 10px; border:1px solid #b8d1ff; border-radius:8px; background:#eef4ff;'>"
+            "1) ID/PW 입력"
+            "</div>"
+            "<div style='font-weight:700; color:#666;'>→</div>"
+            "<div style='padding:8px 10px; border:1px solid #b8d1ff; border-radius:8px; background:#eef4ff;'>"
+            "2) Enter 또는 로그인/동기화"
+            "</div>"
+            "<div style='font-weight:700; color:#666;'>→</div>"
+            "<div style='padding:8px 10px; border:1px solid #b8d1ff; border-radius:8px; background:#eef4ff;'>"
+            "3) 계정 기준 기존 작업 조회"
+            "</div>"
+            "<div style='font-weight:700; color:#666;'>→</div>"
+            f"<div style='padding:8px 10px; border:1px solid #ffd08a; border-radius:8px; background:#fff6e8;'>"
+            f"4) {html.escape(str(start_label))} 클릭"
+            "</div>"
+            "<div style='font-weight:700; color:#666;'>→</div>"
+            "<div style='padding:8px 10px; border:1px solid #ffd08a; border-radius:8px; background:#fff6e8;'>"
+            "5) 중복 실행 체크"
+            "</div>"
+            "<div style='font-weight:700; color:#666;'>→</div>"
+            "<div style='padding:8px 10px; border:1px solid #ffd08a; border-radius:8px; background:#fff6e8;'>"
+            "6) Queue 등록 (running/pending)"
+            "</div>"
+            "<div style='font-weight:700; color:#666;'>→</div>"
+            "<div style='padding:8px 10px; border:1px solid #a8e6c2; border-radius:8px; background:#ecfff4;'>"
+            "7) Worker 실행 (Playwright + RAG + OCR)"
+            "</div>"
+            "<div style='font-weight:700; color:#666;'>→</div>"
+            "<div style='padding:8px 10px; border:1px solid #a8e6c2; border-radius:8px; background:#ecfff4;'>"
+            "8) 결과/스냅샷/로그 저장"
+            "</div>"
+            "<div style='font-weight:700; color:#666;'>→</div>"
+            "<div style='padding:8px 10px; border:1px solid #a8e6c2; border-radius:8px; background:#ecfff4;'>"
+            "9) UI 실시간 반영 (1s)"
+            "</div>"
+            "</div>"
+            "<div style='margin-top:8px; color:#555; font-size:12px;'>"
+            "중복 실행이 감지되면 새 작업은 차단되고 기존 작업 상태 화면으로 자동 포커싱됩니다."
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="e-KHNP Automation", layout="wide")
     st.title("e-KHNP Automation (Prototype)")
@@ -945,43 +996,25 @@ def main() -> None:
         st.session_state.account_user_password_input = settings.user_password
 
     st.subheader("계정 동기화")
-    sync_col, algo_col = st.columns([2, 1])
-    with sync_col:
-        with st.form("account_sync_form", clear_on_submit=False):
-            input_col1, input_col2 = st.columns(2)
-            with input_col1:
-                st.text_input(
-                    "아이디",
-                    key="account_user_id_input",
-                    placeholder="사번 또는 아이디",
-                    autocomplete="username",
-                )
-            with input_col2:
-                st.text_input(
-                    "비밀번호",
-                    key="account_user_password_input",
-                    type="password",
-                    placeholder="비밀번호",
-                    autocomplete="current-password",
-                )
-            st.caption("Enter 또는 로그인/동기화 버튼으로 계정을 동기화한 뒤 Start를 눌러주세요.")
-            login_sync_clicked = st.form_submit_button("로그인/동기화", type="primary", width='stretch')
-    with algo_col:
-        st.caption("실행 알고리즘(간단)")
-        st.code(
-            (
-                "[1] ID/PW 입력\n"
-                "   -> Enter 또는 로그인/동기화\n"
-                "[2] 계정 기준 기존 작업 동기화\n"
-                "   -> running/pending 있으면 이어서 모니터링\n"
-                "   -> 없으면 START 대기\n"
-                "[3] START 클릭\n"
-                "   -> 동일 계정 활성 작업 있으면 중복 차단\n"
-                "[4] 큐 등록 -> 워커 실행\n"
-                "[5] 작업 로그/상태 실시간 반영"
-            ),
-            language="text",
-        )
+    with st.form("account_sync_form", clear_on_submit=False):
+        input_col1, input_col2 = st.columns(2)
+        with input_col1:
+            st.text_input(
+                "아이디",
+                key="account_user_id_input",
+                placeholder="사번 또는 아이디",
+                autocomplete="username",
+            )
+        with input_col2:
+            st.text_input(
+                "비밀번호",
+                key="account_user_password_input",
+                type="password",
+                placeholder="비밀번호",
+                autocomplete="current-password",
+            )
+        st.caption("Enter 또는 로그인/동기화 버튼으로 계정을 동기화한 뒤 Start를 눌러주세요.")
+        login_sync_clicked = st.form_submit_button("로그인/동기화", type="primary", width='stretch')
 
     current_user_id_input = str(st.session_state.get("account_user_id_input", "")).strip()
     current_user_password_input = str(st.session_state.get("account_user_password_input", ""))
@@ -1253,6 +1286,7 @@ def main() -> None:
         width='stretch',
         disabled=one_click_disabled,
     )
+    _render_system_flow_diagram(one_click_button_label)
 
     run_login = False
     run_learning_status = False
