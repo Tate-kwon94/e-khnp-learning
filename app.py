@@ -700,28 +700,58 @@ def _render_live_queue_and_logs_fragment(
 
 def _render_system_flow_diagram(start_label: str) -> None:
     st.caption("시스템 전체 동작도")
-    st.info("1단계: 계정 동기화\n\nID/PW 입력 -> Enter 또는 로그인/동기화 -> 기존 작업 조회")
-    st.caption("↓")
-    st.warning(
-        f"2단계: 실행 등록\n\n{start_label} 클릭 -> 중복 실행 체크 -> 동시 접속 인원 확인(최대 5명)\n\n"
-        "여유 없음: Pending 대기열 / 여유 있음: 즉시 Running"
-    )
-    st.caption("↓")
-    st.success(
-        "3단계: 자동화 실행\n\n인덱스 확인/생성 -> 수료 워크플로우(진도 -> 학습시간 -> 시험) 실행\n\n"
-        "문항 추출: DOM -> Structured -> OCR 폴백"
-    )
-    st.caption("↓")
-    st.warning("4단계: 판단/우회\n\nAI 문제풀이 역량 부족 시 재질문·재시도·강좌 우회\n\n우회 이력은 재시작 후에도 유지")
-    st.caption("↓")
-    st.success("5단계: 저장/표시\n\n결과/품질리포트/스냅샷 저장 -> 실시간 로그/상태 반영")
-    st.caption("중복 실행 감지 시 새 작업은 차단되고, 기존 작업 상태 화면으로 자동 이동합니다.")
-    st.caption(
-        "미구현(작게 표시): "
-        "예상 대기시간(ETA) 자동 계산, "
-        "브라우저 강제 종료 후 체크포인트 기반 자동 재개, "
-        "FastAPI/Redis 분산 큐 전환"
-    )
+    start_safe = html.escape(str(start_label))
+    diagram_html = f"""
+<div style="border:1px solid #d9d9d9; border-radius:8px; padding:10px; background:#fafafa;">
+  <div style="display:flex; flex-direction:column; gap:8px;">
+    <div style="border:1px solid #b8d1ff; border-radius:8px; padding:8px; background:#eef4ff;">
+      <div style="font-weight:700; color:#1e3a8a; font-size:12px;">1단계: 계정 동기화</div>
+      <div style="font-size:12px; color:#1f2937; margin-top:4px;">ID/PW 입력 → Enter 또는 로그인/동기화 → 기존 작업 조회</div>
+    </div>
+    <div style="text-align:center; color:#6b7280; font-size:14px;">↓</div>
+    <div style="border:1px solid #f3c98b; border-radius:8px; padding:8px; background:#fff6e8;">
+      <div style="font-weight:700; color:#92400e; font-size:12px;">2단계: 실행 등록</div>
+      <div style="font-size:12px; color:#1f2937; margin-top:4px;">
+        {start_safe} 클릭 → 중복 실행 체크 → 동시 접속 인원 확인(최대 5명)
+      </div>
+      <div style="font-size:11px; color:#4b5563; margin-top:2px;">여유 없음: Pending 대기열 / 여유 있음: 즉시 Running</div>
+    </div>
+    <div style="text-align:center; color:#6b7280; font-size:14px;">↓</div>
+    <div style="border:1px solid #9fdcc3; border-radius:8px; padding:8px; background:#ecfff4;">
+      <div style="font-weight:700; color:#065f46; font-size:12px;">3단계: 자동화 실행</div>
+      <div style="font-size:12px; color:#1f2937; margin-top:4px;">
+        인덱스 확인/생성 → 수료 워크플로우(진도 → 학습시간 → 시험) 실행
+      </div>
+      <div style="font-size:11px; color:#4b5563; margin-top:2px;">문항 추출: DOM → Structured → OCR 폴백</div>
+    </div>
+    <div style="text-align:center; color:#6b7280; font-size:14px;">↓</div>
+    <div style="border:1px solid #f3c98b; border-radius:8px; padding:8px; background:#fff6e8;">
+      <div style="font-weight:700; color:#92400e; font-size:12px;">4단계: 판단/우회</div>
+      <div style="font-size:12px; color:#1f2937; margin-top:4px;">
+        AI 문제풀이 역량 부족 시 재질문·재시도·강좌 우회
+      </div>
+      <div style="font-size:11px; color:#4b5563; margin-top:2px;">우회 이력은 재시작 후에도 유지</div>
+    </div>
+    <div style="text-align:center; color:#6b7280; font-size:14px;">↓</div>
+    <div style="border:1px solid #9fdcc3; border-radius:8px; padding:8px; background:#ecfff4;">
+      <div style="font-weight:700; color:#065f46; font-size:12px;">5단계: 저장/표시</div>
+      <div style="font-size:12px; color:#1f2937; margin-top:4px;">
+        결과/품질리포트/스냅샷 저장 → 실시간 로그/상태 반영
+      </div>
+    </div>
+  </div>
+  <div style="margin-top:8px; color:#555; font-size:12px;">
+    중복 실행 감지 시 새 작업은 차단되고, 기존 작업 상태 화면으로 자동 이동합니다.
+  </div>
+  <div style="margin-top:6px; color:#777; font-size:10px; line-height:1.35;">
+    미구현(작게 표시):
+    ① 예상 대기시간(ETA) 자동 계산,
+    ② 브라우저 강제 종료 후 체크포인트 기반 자동 재개,
+    ③ FastAPI/Redis 분산 큐 전환
+  </div>
+</div>
+"""
+    st.markdown(diagram_html, unsafe_allow_html=True)
 
 
 def main() -> None:
