@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import html
 import json
@@ -561,11 +562,35 @@ class RagExamSolver:
             brace = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
             if brace:
                 cleaned = brace.group(0)
-        try:
-            obj = json.loads(cleaned)
-        except Exception:  # noqa: BLE001
-            return None
-        return obj if isinstance(obj, dict) else None
+
+        normalized = (
+            cleaned.replace("\u201c", '"')
+            .replace("\u201d", '"')
+            .replace("\u2018", "'")
+            .replace("\u2019", "'")
+        )
+        normalized = re.sub(r",\s*([}\]])", r"\1", normalized)
+
+        candidates = [cleaned, normalized]
+        seen: set[str] = set()
+        for candidate in candidates:
+            src = candidate.strip()
+            if not src or src in seen:
+                continue
+            seen.add(src)
+            try:
+                obj = json.loads(src)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                obj = ast.literal_eval(src)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:  # noqa: BLE001
+                continue
+        return None
 
     def _score_options(self, question: str, options: list[str], contexts: list[dict[str, Any]]) -> list[float]:
         if not options:
@@ -704,9 +729,10 @@ class RagExamSolver:
             if web_hits:
                 fallback_eids.append(str(web_hits[0].get("id", "")))
             fallback_eids = [x for x in fallback_eids if x]
+            fallback_conf = round(max(0.45, det_conf) + 1e-9, 2)
             return SolveResult(
                 choice=det_choice,
-                confidence=max(0.45, det_conf),
+                confidence=fallback_conf,
                 reason="LLM JSON 파싱 실패, 하이브리드 검색 점수 폴백",
                 evidence_ids=fallback_eids,
             )

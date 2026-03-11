@@ -3180,20 +3180,22 @@ class EKHNPAutomator:
                     if total > 0:
                         required_correct = (total * pass_score + 99) // 100
                         dynamic_budget = max(0, total - required_correct)
+                    confidence_gate = round(confidence + 1e-9, 2)
+                    low_conf_floor_gate = round(low_conf_floor + 1e-9, 2)
 
-                    if confidence >= low_conf_floor and low_conf_used < dynamic_budget:
+                    if confidence_gate >= low_conf_floor_gate and low_conf_used < dynamic_budget:
                         low_conf_used += 1
                         self._log(
                             "LLM 저신뢰 문항 허용 진행: "
-                            f"Q {current}/{total} conf={confidence:.2f} "
-                            f"(used {low_conf_used}/{dynamic_budget}, floor={low_conf_floor:.2f})"
+                            f"Q {current}/{total} conf={confidence_gate:.2f} "
+                            f"(used {low_conf_used}/{dynamic_budget}, floor={low_conf_floor_gate:.2f})"
                         )
                     else:
                         skipped += 1
                         return _payload(
                             False,
                             (
-                                f"LLM 신뢰도 낮음(conf={confidence:.2f}, floor={low_conf_floor:.2f}, "
+                                f"LLM 신뢰도 낮음(conf={confidence_gate:.2f}, floor={low_conf_floor_gate:.2f}, "
                                 f"low_conf_used={low_conf_used}/{dynamic_budget}): {reason}"
                             ),
                         )
