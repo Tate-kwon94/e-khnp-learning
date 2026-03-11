@@ -166,6 +166,30 @@ def _safe_log_fn(task_settings: Settings, log_fn: Callable[[str], None]) -> Call
     return _wrapped
 
 
+def _account_owner_key(user_id: str, fallback_viewer_id: str) -> str:
+    normalized = re.sub(r"\s+", "", str(user_id or "").strip()).lower()
+    if not normalized:
+        return f"anon:{fallback_viewer_id}"
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"acct:{digest}"
+
+
+def _account_owner_label(user_id: str, fallback_viewer_id: str) -> str:
+    normalized = re.sub(r"\s+", "", str(user_id or "").strip())
+    if normalized:
+        return normalized
+    return f"anonymous-{fallback_viewer_id[:6]}"
+
+
+def _consume_new_job_logs(job_id: str, logs: list[str]) -> list[str]:
+    cursor_map = st.session_state.setdefault("job_log_cursor", {})
+    previous = int(cursor_map.get(job_id, 0))
+    previous = max(0, min(previous, len(logs)))
+    new_lines = logs[previous:]
+    cursor_map[job_id] = len(logs)
+    return new_lines
+
+
 def _build_task_settings(
     *,
     user_id_input: str,
@@ -272,13 +296,39 @@ def _run_one_click(
     if need_reindex:
         _run_rag_index(task_settings, safe_log)
 
-    return _run_automator_method(
+    first = _run_automator_method(
         task_settings,
         "login_and_run_completion_workflow",
         safe_log,
         check_interval_minutes=check_interval_minutes,
         max_timefill_checks=max_timefill_checks,
     )
+    if bool(first.get("success", False)):
+        return first
+
+    message = str(first.get("message", "")).lower()
+    transient_tokens = [
+        "target page",
+        "browser has been closed",
+        "context has been closed",
+        "타임아웃",
+        "timeout",
+    ]
+    should_retry = any(token in message for token in transient_tokens)
+    if not should_retry:
+        return first
+
+    safe_log("원클릭 1차 실패 감지: 일시 오류로 판단되어 자동 재시도 1회를 진행합니다.")
+    second = _run_automator_method(
+        task_settings,
+        "login_and_run_completion_workflow",
+        safe_log,
+        check_interval_minutes=check_interval_minutes,
+        max_timefill_checks=max_timefill_checks,
+    )
+    if not bool(second.get("success", False)):
+        safe_log(f"원클릭 자동 재시도 실패: {second.get('message', '')}")
+    return second
 
 
 def _enqueue_job(
@@ -287,10 +337,38 @@ def _enqueue_job(
     name: str,
     runner: Callable[[Callable[[str], None]], dict[str, Any]],
     owner: str,
+    owner_label: str,
     role: str,
 ) -> str | None:
+    active_job = queue_manager.find_active_job(owner=owner)
+    if active_job is not None:
+        active_job_id = str(active_job.get("job_id", ""))
+        active_name = str(active_job.get("name", ""))
+        active_status = str(active_job.get("status", ""))
+        append_log(
+            f"[QUEUE] 중복 등록 차단: owner={owner_label} new={name} existing={active_name}({active_status})/{active_job_id}"
+        )
+        _audit_security_event(
+            settings,
+            "queue_submit_blocked_active_owner",
+            owner=owner_label,
+            task=name,
+            active_job_id=active_job_id,
+            active_status=active_status,
+            active_name=active_name,
+        )
+        if active_job_id:
+            st.session_state.selected_job_id = active_job_id
+            st.warning(
+                "동일 계정에서 이미 실행 중인 작업이 있습니다. "
+                f"기존 작업을 확인하세요. id={active_job_id} / status={active_status}"
+            )
+            return active_job_id
+        st.warning("동일 계정에서 이미 실행 중인 작업이 있어 신규 등록을 차단했습니다.")
+        return None
+
     try:
-        job_id = queue_manager.submit(name, runner, owner=owner, role=role)
+        job_id = queue_manager.submit(name, runner, owner=owner, owner_label=owner_label, role=role)
     except QueueCapacityError as exc:
         append_log(f"[QUEUE] 등록 거부: {name} / reason={exc}")
         _audit_security_event(settings, "queue_submit_rejected", task=name, reason=str(exc))
@@ -324,9 +402,57 @@ def _render_queue_status(
     queue_manager: TaskQueueManager,
     owner: str | None = None,
     compact: bool = False,
+    is_admin: bool = False,
 ) -> bool:
     st.subheader("작업 큐 상태")
-    stats = queue_manager.get_stats(owner=owner)
+    owner_filter = owner
+
+    if is_admin and owner is None:
+        owner_rows = queue_manager.owner_stats()
+        active_owner_count = sum(1 for row in owner_rows if int(row.get("pending", 0)) > 0 or int(row.get("running", 0)) > 0)
+        overall_stats = queue_manager.get_stats(owner=None)
+
+        o1, o2, o3, o4, o5 = st.columns(5)
+        o1.metric("활성 계정", active_owner_count)
+        o2.metric("전체 Pending", overall_stats["pending"])
+        o3.metric("전체 Running", overall_stats["running"])
+        o4.metric("전체 Failed", overall_stats["failed"])
+        o5.metric("전체 Total", overall_stats["total"])
+
+        if owner_rows:
+            table_rows = [
+                {
+                    "owner_label": str(row.get("owner_label") or row.get("owner")),
+                    "pending": int(row.get("pending", 0)),
+                    "running": int(row.get("running", 0)),
+                    "failed": int(row.get("failed", 0)),
+                    "succeeded": int(row.get("succeeded", 0)),
+                    "total": int(row.get("total", 0)),
+                    "latest_created_at": str(row.get("latest_created_at", "")),
+                }
+                for row in owner_rows
+            ]
+            st.caption("계정별 큐 현황")
+            st.dataframe(table_rows, use_container_width=True, hide_index=True)
+
+            owner_options = ["__all__"] + [str(row.get("owner", "")) for row in owner_rows]
+            owner_labels = {
+                "__all__": "전체 계정",
+                **{
+                    str(row.get("owner", "")): str(row.get("owner_label") or row.get("owner"))
+                    for row in owner_rows
+                },
+            }
+            selected_owner = st.selectbox(
+                "관리자 계정 필터",
+                options=owner_options,
+                index=0,
+                format_func=lambda x: owner_labels.get(str(x), str(x)),
+            )
+            if selected_owner != "__all__":
+                owner_filter = str(selected_owner)
+
+    stats = queue_manager.get_stats(owner=owner_filter)
     has_active_jobs = int(stats["pending"]) > 0 or int(stats["running"]) > 0
     s1, s2, s3, s4, s5 = st.columns(5)
     s1.metric("Pending", stats["pending"])
@@ -340,10 +466,50 @@ def _render_queue_status(
     with right:
         st.button("상태 새로고침", use_container_width=True)
 
-    jobs = queue_manager.list_jobs(limit=30, owner=owner)
+    jobs = queue_manager.list_jobs(limit=50, owner=owner_filter)
     if not jobs:
         st.info("등록된 작업이 없습니다.")
         return has_active_jobs
+
+    def _pending_position(target_job_id: str) -> tuple[int, int]:
+        pending_jobs = [j for j in jobs if str(j.get("status")) == "pending"]
+        for idx, row in enumerate(pending_jobs, start=1):
+            if str(row.get("job_id")) == target_job_id:
+                return idx, len(pending_jobs)
+        return 0, len(pending_jobs)
+
+    def _render_retry_button(job: dict[str, Any], button_key: str) -> None:
+        if str(job.get("status")) != "failed":
+            return
+        if st.button("실패 작업 재시도", key=button_key, use_container_width=False):
+            owner_key = str(job.get("owner") or "").strip()
+            if owner_key:
+                active = queue_manager.find_active_job(owner=owner_key)
+                if active is not None:
+                    st.warning(
+                        "동일 계정에 실행 중 작업이 있어 재시도를 대기시켰습니다. "
+                        f"id={active.get('job_id', '-')}, status={active.get('status', '-')}"
+                    )
+                    st.session_state.selected_job_id = str(active.get("job_id", st.session_state.get("selected_job_id", "")))
+                    return
+            try:
+                retry_job_id = queue_manager.retry_job(str(job.get("job_id", "")))
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"재시도 등록 실패: {exc}")
+                return
+            st.session_state.selected_job_id = retry_job_id
+            st.success(f"재시도 작업을 등록했습니다. id={retry_job_id}")
+
+    def _render_job_logs(job: dict[str, Any], *, key_suffix: str, height_px: int) -> None:
+        job_id = str(job.get("job_id", ""))
+        logs = list(job.get("logs") or [])
+        new_lines = _consume_new_job_logs(job_id, logs)
+        if new_lines:
+            st.caption(f"새 로그 {len(new_lines)}줄")
+            _render_scrollable_log_block(new_lines[-120:], height_px=150, empty_text="(새 로그 없음)")
+        recent_only = st.checkbox("최근 로그만 보기", value=True, key=f"recent_logs_{key_suffix}")
+        lines_for_view = logs[-300:] if recent_only else logs
+        _render_scrollable_log_block(lines_for_view, height_px=height_px, empty_text="(작업 로그 없음)")
 
     if compact:
         current_job = next((job for job in jobs if job.get("status") in {"pending", "running"}), jobs[0])
@@ -352,6 +518,10 @@ def _render_queue_status(
             f" / 상태: {current_job.get('status', '-')}"
             f" / 생성: {current_job.get('created_at', '-')}"
         )
+        if current_job.get("status") == "pending":
+            pending_pos, pending_total = _pending_position(str(current_job.get("job_id", "")))
+            if pending_pos > 0:
+                st.info(f"대기 순번: {pending_pos}/{pending_total} (워커 {queue_manager.worker_count}개)")
         if current_job.get("status") == "succeeded":
             message = ""
             if current_job.get("result"):
@@ -362,17 +532,17 @@ def _render_queue_status(
                 st.success("작업 완료")
         elif current_job.get("status") == "failed":
             st.error(current_job.get("error") or "작업 실패")
-
-        _render_scrollable_log_block(
-            list(current_job.get("logs") or []),
-            height_px=220,
-            empty_text="(작업 로그 없음)",
-        )
+        _render_retry_button(current_job, button_key=f"retry_compact_{current_job.get('job_id', '')}")
+        history_path = str(current_job.get("history_path", "")).strip()
+        if history_path:
+            st.caption(f"작업 스냅샷: {history_path}")
+        _render_job_logs(current_job, key_suffix=f"compact_{current_job.get('job_id', '')}", height_px=220)
         return has_active_jobs
 
     rows = [
         {
             "job_id": job["job_id"],
+            "owner_label": str(job.get("owner_label") or job.get("owner") or ""),
             "name": job["name"],
             "status": job["status"],
             "created_at": job["created_at"],
@@ -406,12 +576,18 @@ def _render_queue_status(
             st.success("작업 완료")
     elif job["status"] == "failed":
         st.error(job.get("error") or "작업 실패")
+        _render_retry_button(job, button_key=f"retry_detail_{job.get('job_id', '')}")
 
-    _render_scrollable_log_block(
-        list(job.get("logs") or []),
-        height_px=260,
-        empty_text="(작업 로그 없음)",
-    )
+    if job.get("status") == "pending":
+        pending_pos, pending_total = _pending_position(str(job.get("job_id", "")))
+        if pending_pos > 0:
+            st.info(f"대기 순번: {pending_pos}/{pending_total} (워커 {queue_manager.worker_count}개)")
+
+    history_path = str(job.get("history_path", "")).strip()
+    if history_path:
+        st.caption(f"작업 스냅샷: {history_path}")
+
+    _render_job_logs(job, key_suffix=f"detail_{job.get('job_id', '')}", height_px=260)
 
     if job.get("traceback"):
         with st.expander("실패 traceback"):
@@ -501,6 +677,8 @@ def main() -> None:
     force_ui_role = settings.app_force_ui_role if settings.app_force_ui_role in {"user", "admin"} else ""
     if "viewer_id" not in st.session_state:
         st.session_state.viewer_id = uuid.uuid4().hex
+    if "job_log_cursor" not in st.session_state:
+        st.session_state.job_log_cursor = {}
     if "ui_role" not in st.session_state:
         st.session_state.ui_role = default_ui_role
     if "admin_unlocked" not in st.session_state:
@@ -583,6 +761,21 @@ def main() -> None:
                 help="원클릭 실행 + 진도율→시험평가→학습시간 보충 + 1차시 직접진입/동적시간체크 + 시험없음/응시보존/정답지 인덱싱 재응시",
             )
         st.progress(0.98, text="전체 진행률 98%")
+        st.caption("운영 실시간 현황")
+        owner_rows = queue_manager.owner_stats()
+        active_owner_count = sum(
+            1 for row in owner_rows if int(row.get("pending", 0)) > 0 or int(row.get("running", 0)) > 0
+        )
+        overall_stats = queue_manager.get_stats(owner=None)
+        op_col1, op_col2, op_col3, op_col4 = st.columns(4)
+        with op_col1:
+            st.metric("활성 계정", active_owner_count)
+        with op_col2:
+            st.metric("전체 Pending", overall_stats["pending"])
+        with op_col3:
+            st.metric("전체 Running", overall_stats["running"])
+        with op_col4:
+            st.metric("전체 Failed", overall_stats["failed"])
 
     st.subheader("로그인 정보 입력")
     input_col1, input_col2 = st.columns(2)
@@ -735,6 +928,12 @@ def main() -> None:
         exam_auto_retry_max=exam_auto_retry_max,
         exam_retry_requires_answer_index=exam_retry_requires_answer_index,
     )
+    queue_owner_key = _account_owner_key(task_settings.user_id, viewer_id)
+    queue_owner_label = _account_owner_label(task_settings.user_id, viewer_id)
+    if task_settings.user_id:
+        st.caption(f"큐 계정 식별자: {queue_owner_label}")
+    else:
+        st.warning("아이디가 비어 있어 익명 세션 큐로 처리됩니다. 브라우저 재접속 시 작업 추적이 끊길 수 있습니다.")
 
     if is_admin:
         st.subheader("설정 확인")
@@ -843,7 +1042,8 @@ def main() -> None:
                 force_reindex=one_click_force_reindex,
                 log_fn=log_fn,
             ),
-            owner=viewer_id,
+            owner=queue_owner_key,
+            owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
         )
         if job_id:
@@ -855,7 +1055,8 @@ def main() -> None:
             queue_manager,
             "로그인 테스트",
             lambda log_fn, s=task_settings: _run_automator_method(s, "login", log_fn),
-            owner=viewer_id,
+            owner=queue_owner_key,
+            owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
         )
         if job_id:
@@ -867,7 +1068,8 @@ def main() -> None:
             queue_manager,
             "로그인 + 나의 학습현황 이동",
             lambda log_fn, s=task_settings: _run_automator_method(s, "login_and_open_learning_status", log_fn),
-            owner=viewer_id,
+            owner=queue_owner_key,
+            owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
         )
         if job_id:
@@ -879,7 +1081,8 @@ def main() -> None:
             queue_manager,
             "첫 과목 학습 시작",
             lambda log_fn, s=task_settings: _run_automator_method(s, "login_and_enter_first_course", log_fn),
-            owner=viewer_id,
+            owner=queue_owner_key,
+            owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
         )
         if job_id:
@@ -897,7 +1100,8 @@ def main() -> None:
                 stop_rule=sr,
                 manual_lesson_limit=ml,
             ),
-            owner=viewer_id,
+            owner=queue_owner_key,
+            owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
         )
         if job_id:
@@ -914,7 +1118,8 @@ def main() -> None:
                 log_fn,
                 max_questions=limit,
             ),
-            owner=viewer_id,
+            owner=queue_owner_key,
+            owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
         )
         if job_id:
@@ -932,7 +1137,8 @@ def main() -> None:
                 check_interval_minutes=timefill_check_interval_min,
                 max_timefill_checks=timefill_check_limit,
             ),
-            owner=viewer_id,
+            owner=queue_owner_key,
+            owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
         )
         if job_id:
@@ -944,7 +1150,8 @@ def main() -> None:
             queue_manager,
             "RAG 인덱스 생성",
             lambda log_fn, s=task_settings: _run_rag_index(s, log_fn),
-            owner=viewer_id,
+            owner=queue_owner_key,
+            owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
         )
         if job_id:
@@ -963,7 +1170,8 @@ def main() -> None:
                 rag_top_k=rag_top_k,
                 confidence_threshold=rag_conf_threshold,
             ),
-            owner=viewer_id,
+            owner=queue_owner_key,
+            owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
         )
         if job_id:
@@ -971,20 +1179,21 @@ def main() -> None:
 
     has_active_jobs = _render_queue_status(
         queue_manager,
-        owner=None if is_admin else viewer_id,
+        owner=None if is_admin else queue_owner_key,
         compact=not is_admin,
+        is_admin=is_admin,
     )
 
     st.subheader("실행 로그")
     recent_logs = list(st.session_state.logs[-500:]) if st.session_state.logs else []
     _render_scrollable_log_block(recent_logs, height_px=260, empty_text="(아직 로그 없음)")
 
-    if not is_admin:
-        auto_refresh = st.checkbox("작업 상태 자동 업데이트(5초)", value=True)
-        if auto_refresh and has_active_jobs:
-            st.caption("작업 진행 중 상태를 반영하기 위해 5초마다 자동 새로고침합니다.")
-            time.sleep(5)
-            st.rerun()
+    auto_refresh_default = not is_admin
+    auto_refresh = st.checkbox("작업 상태 자동 업데이트(5초)", value=auto_refresh_default)
+    if auto_refresh and has_active_jobs:
+        st.caption("작업 진행 중 상태를 반영하기 위해 5초마다 자동 새로고침합니다.")
+        time.sleep(5)
+        st.rerun()
 
 
 if __name__ == "__main__":

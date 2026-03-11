@@ -252,6 +252,31 @@ class EKHNPAutomator:
             self.log_fn(message)
 
     @staticmethod
+    def _is_page_available(page: Optional[Page]) -> bool:
+        if page is None:
+            return False
+        try:
+            return not page.is_closed()
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _wait_with_page_guard(self, page: Optional[Page], total_ms: int, chunk_ms: int = 30000) -> bool:
+        if not self._is_page_available(page):
+            return False
+        remain = max(0, int(total_ms))
+        chunk = max(500, int(chunk_ms))
+        while remain > 0:
+            if not self._is_page_available(page):
+                return False
+            step = min(remain, chunk)
+            try:
+                page.wait_for_timeout(step)
+            except Exception:  # noqa: BLE001
+                return False
+            remain -= step
+        return True
+
+    @staticmethod
     def _course_title_key(title: str) -> str:
         return re.sub(r"\s+", " ", str(title or "").strip()).lower()
 
@@ -377,6 +402,12 @@ class EKHNPAutomator:
             except PlaywrightTimeoutError:
                 return LoginResult(False, "타임아웃이 발생했습니다.", page.url)
             except Exception as exc:  # noqa: BLE001
+                try:
+                    debug_page = locals().get("classroom_page", None) or page
+                    if self._is_page_available(debug_page):
+                        self._dump_player_debug(debug_page, "completion_workflow_exception")
+                except Exception:  # noqa: BLE001
+                    pass
                 return LoginResult(False, f"오류 발생: {exc}", page.url)
             finally:
                 context.close()
@@ -1276,7 +1307,17 @@ class EKHNPAutomator:
                             f"(다음 확인 {wait_minutes}분 후, 남은시간 "
                             f"{self._format_seconds(int(time_status.get('shortage_seconds', 0)))} )"
                         )
-                        keepalive_page.wait_for_timeout(wait_minutes * 60 * 1000)
+                        waited = self._wait_with_page_guard(keepalive_page, wait_minutes * 60 * 1000)
+                        if not waited:
+                            self._log("학습시간 보충 대기 중 학습창 종료 감지: 학습창 재오픈을 시도합니다.")
+                            keepalive_page = self._open_first_lesson_popup_for_timefill(classroom_page)
+                            if keepalive_page is None:
+                                return LoginResult(
+                                    False,
+                                    "학습시간 보충 대기 중 학습창이 종료되어 재오픈에 실패했습니다.",
+                                    classroom_page.url,
+                                )
+                            continue
                         self._refresh_classroom_page(classroom_page)
                         time_status = self._extract_study_time_status(classroom_page)
                         if bool(time_status.get("requirement_known", False)):
@@ -4478,6 +4519,12 @@ class EKHNPAutomator:
             'input[value*="다음"]',
             'button:has-text("Next")',
             'a:has-text("Next")',
+            'button:has-text(">")',
+            'a:has-text(">")',
+            'button:has-text("›")',
+            'a:has-text("›")',
+            '[aria-label*="다음"]',
+            '[aria-label*="next"]',
             'a[onclick*="next"]',
             'button[onclick*="next"]',
         ]
@@ -4526,11 +4573,14 @@ class EKHNPAutomator:
                           ).filter(isVisible);
                           const target = cands.find((el) => {
                             const txt = norm(el.textContent || el.value);
+                            const aria = norm(el.getAttribute('aria-label') || el.getAttribute('title') || '');
                             const oc = (el.getAttribute('onclick') || '').toLowerCase();
                             const byText = txt.includes('다음') || txt.includes('next') || txt.includes('다음문항');
+                            const byArrow = txt === '>' || txt === '›' || txt === '＞' || txt === '→' || txt.endsWith(' >');
+                            const byAria = aria.includes('다음') || aria.includes('next');
                             const byCount = oc.includes(`nowcount:${current}`) || oc.includes(`nowcount:'${current}'`);
                             const byNextApi = oc.includes('donextshowitem') || oc.includes('nextindex');
-                            return byText || byCount || byNextApi;
+                            return byText || byArrow || byAria || byCount || byNextApi;
                           });
                           if (!target) return false;
 
@@ -4563,11 +4613,18 @@ class EKHNPAutomator:
                       );
                       const target = cands.find((el) => {
                         const txt = normalize(el.textContent || el.value);
+                        const aria = normalize(el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title')) || '');
                         return isVisible(el) && (
                           txt.includes('다음')
                           || txt.includes('next')
                           || txt.includes('다음문항')
                           || txt.includes('next question')
+                          || txt === '>'
+                          || txt === '›'
+                          || txt === '＞'
+                          || txt === '→'
+                          || aria.includes('다음')
+                          || aria.includes('next')
                         );
                       });
                       if (!target) return false;
@@ -5633,7 +5690,13 @@ class EKHNPAutomator:
                 f"(다음 확인 {wait_minutes}분 후, 남은시간 "
                 f"{self._format_seconds(int(time_status.get('shortage_seconds', 0)))} )"
             )
-            keepalive_page.wait_for_timeout(wait_minutes * 60 * 1000)
+            waited = self._wait_with_page_guard(keepalive_page, wait_minutes * 60 * 1000)
+            if not waited:
+                self._log("우회 전 학습시간 보충 대기 중 학습창 종료 감지: 학습창 재오픈을 시도합니다.")
+                keepalive_page = self._open_first_lesson_popup_for_timefill(classroom_page)
+                if keepalive_page is None:
+                    return LoginResult(False, "우회 전 학습시간 보충 학습창이 종료되어 재오픈에 실패했습니다.", classroom_page.url)
+                continue
             self._refresh_classroom_page(classroom_page)
             time_status = self._extract_study_time_status(classroom_page)
             if bool(time_status.get("requirement_known", False)):
@@ -6382,9 +6445,17 @@ class EKHNPAutomator:
             '#nextBtn a.next',
             'a[onclick*="doNext"]',
             "button.nextPage",
+            "a.next",
+            "button.next",
             'button:has-text("다음")',
             'a:has-text("다음")',
+            'button:has-text(">")',
+            'a:has-text(">")',
+            'button:has-text("›")',
+            'a:has-text("›")',
             '[role="button"]:has-text("다음")',
+            '[aria-label*="다음"]',
+            '[aria-label*="next"]',
             'span:has-text("다음")',
             'div:has-text("다음")',
         ]
@@ -6399,8 +6470,10 @@ class EKHNPAutomator:
                 () => {
                     const nodes = Array.from(document.querySelectorAll('a,button,span,div'));
                     const visibles = nodes.filter((n) => {
-                      const txt = (n.textContent || '').trim();
-                      if (txt !== '다음') return false;
+                      const txt = (n.textContent || '').trim().toLowerCase();
+                      const aria = String(n.getAttribute('aria-label') || n.getAttribute('title') || '').trim().toLowerCase();
+                      const pass = txt === '다음' || txt === 'next' || txt === '>' || txt === '›' || txt === '＞' || txt === '→';
+                      if (!pass && !aria.includes('next') && !aria.includes('다음')) return false;
                       const r = n.getBoundingClientRect();
                       return r.width > 0 && r.height > 0;
                     });
@@ -6573,6 +6646,10 @@ class EKHNPAutomator:
             '#nextBtn a.next:has-text("다음")',
             '#nextBtn a.next',
             'a.next:has-text("다음")',
+            'a.next:has-text(">")',
+            'a.next:has-text("›")',
+            '[aria-label*="다음"]',
+            '[aria-label*="next"]',
             'a[onclick*="doNext"]',
         ]
         clicked = self._click_first_visible(page, selectors, max_items=10)

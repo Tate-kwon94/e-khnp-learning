@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
+from pathlib import Path
 import queue
 import threading
 import traceback
@@ -27,6 +29,7 @@ class Job:
     error: str | None = None
     traceback: str | None = None
     owner: str | None = None
+    owner_label: str | None = None
     role: str | None = None
     logs: list[str] = field(default_factory=list)
 
@@ -42,13 +45,17 @@ class TaskQueueManager:
         max_logs_per_job: int = 1500,
         max_pending: int = 20,
         max_history: int = 200,
+        history_dir: str = ".runtime/job_history",
     ) -> None:
         self.worker_count = max(1, worker_count)
         self.max_logs_per_job = max(200, max_logs_per_job)
         self.max_pending = max(1, max_pending)
         self.max_history = max(self.max_pending + 10, max_history)
+        self.history_dir = Path(history_dir)
+        self.history_dir.mkdir(parents=True, exist_ok=True)
         self._queue: queue.Queue[tuple[str, RunnerFn]] = queue.Queue()
         self._jobs: dict[str, Job] = {}
+        self._runner_registry: dict[str, tuple[str, RunnerFn, str | None, str | None, str | None]] = {}
         self._lock = threading.Lock()
         self._workers: list[threading.Thread] = []
         self._start_workers()
@@ -68,6 +75,7 @@ class TaskQueueManager:
         name: str,
         runner: RunnerFn,
         owner: str | None = None,
+        owner_label: str | None = None,
         role: str | None = None,
     ) -> str:
         now = datetime.utcnow()
@@ -81,6 +89,7 @@ class TaskQueueManager:
             created_at=now_iso,
             created_ts=now_ts,
             owner=owner,
+            owner_label=owner_label,
             role=role,
         )
         with self._lock:
@@ -102,8 +111,75 @@ class TaskQueueManager:
                     f"[{now_iso}] 즉시 실행 대기: 실행 슬롯 여유({running_now}/{self.worker_count})"
                 )
             self._jobs[job_id] = job
+            self._runner_registry[job_id] = (name, runner, owner, owner_label, role)
         self._queue.put((job_id, runner))
         return job_id
+
+    def find_active_job(self, owner: str | None = None, name: str | None = None) -> dict[str, Any] | None:
+        with self._lock:
+            candidates = [
+                j
+                for j in self._jobs.values()
+                if j.status in {"pending", "running"} and (owner is None or j.owner == owner)
+            ]
+            if name:
+                candidates = [j for j in candidates if str(j.name) == str(name)]
+            if not candidates:
+                return None
+            picked = sorted(candidates, key=lambda j: j.created_ts)[0]
+            return self._snapshot(picked)
+
+    def owner_stats(self) -> list[dict[str, Any]]:
+        with self._lock:
+            grouped: dict[str, dict[str, Any]] = {}
+            for j in self._jobs.values():
+                owner_key = str(j.owner or "unknown")
+                row = grouped.setdefault(
+                    owner_key,
+                    {
+                        "owner": owner_key,
+                        "owner_label": str(j.owner_label or ""),
+                        "pending": 0,
+                        "running": 0,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "total": 0,
+                        "latest_created_at": j.created_at,
+                        "latest_created_ts": float(j.created_ts),
+                    },
+                )
+                row["total"] += 1
+                if j.status == "pending":
+                    row["pending"] += 1
+                elif j.status == "running":
+                    row["running"] += 1
+                elif j.status == "succeeded":
+                    row["succeeded"] += 1
+                elif j.status == "failed":
+                    row["failed"] += 1
+                if float(j.created_ts) >= float(row["latest_created_ts"]):
+                    row["latest_created_ts"] = float(j.created_ts)
+                    row["latest_created_at"] = j.created_at
+                    if j.owner_label:
+                        row["owner_label"] = str(j.owner_label)
+            rows = sorted(grouped.values(), key=lambda x: float(x["latest_created_ts"]), reverse=True)
+            for row in rows:
+                row.pop("latest_created_ts", None)
+            return rows
+
+    def retry_job(self, job_id: str, owner: str | None = None, role: str | None = None) -> str:
+        with self._lock:
+            original = self._runner_registry.get(job_id)
+            if original is None:
+                raise RuntimeError("재시도할 작업 원본을 찾지 못했습니다.")
+            name, runner, orig_owner, orig_owner_label, orig_role = original
+        return self.submit(
+            name=f"{name} (retry)",
+            runner=runner,
+            owner=owner if owner is not None else orig_owner,
+            owner_label=orig_owner_label,
+            role=role if role is not None else orig_role,
+        )
 
     def list_jobs(self, limit: int = 20, owner: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
@@ -131,7 +207,9 @@ class TaskQueueManager:
             jobs = self._jobs.values()
             if owner is not None:
                 jobs = [j for j in jobs if j.owner == owner]
+            total = 0
             for job in jobs:
+                total += 1
                 if job.status == "pending":
                     pending += 1
                 elif job.status == "running":
@@ -145,7 +223,7 @@ class TaskQueueManager:
                 "running": running,
                 "succeeded": succeeded,
                 "failed": failed,
-                "total": len(self._jobs),
+                "total": total,
             }
 
     def _worker_loop(self) -> None:
@@ -212,6 +290,8 @@ class TaskQueueManager:
                 else:
                     job.logs.append(f"[{now_iso}] 작업 완료")
             self._trim_logs(job)
+            snapshot = self._snapshot(job)
+        self._persist_job_snapshot(snapshot)
 
     def _append_log(self, job_id: str, message: str) -> None:
         now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -236,10 +316,19 @@ class TaskQueueManager:
                 break
             if job.status in {"succeeded", "failed"}:
                 self._jobs.pop(job.job_id, None)
+                self._runner_registry.pop(job.job_id, None)
         if len(self._jobs) < self.max_history:
             return
         if ordered:
             self._jobs.pop(ordered[0].job_id, None)
+            self._runner_registry.pop(ordered[0].job_id, None)
+
+    def _persist_job_snapshot(self, snapshot: dict[str, Any]) -> None:
+        try:
+            path = self.history_dir / f"{snapshot.get('job_id', 'unknown')}.json"
+            path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            return
 
     def _snapshot(self, job: Job) -> dict[str, Any]:
         return {
@@ -253,8 +342,10 @@ class TaskQueueManager:
             "error": job.error,
             "traceback": job.traceback,
             "owner": job.owner,
+            "owner_label": job.owner_label,
             "role": job.role,
             "logs": list(job.logs),
+            "history_path": str((self.history_dir / f"{job.job_id}.json").as_posix()),
         }
 
 
