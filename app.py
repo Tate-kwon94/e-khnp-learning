@@ -886,24 +886,92 @@ def main() -> None:
         with op_col4:
             st.metric("전체 Failed", overall_stats["failed"])
 
-    st.subheader("로그인 정보 입력")
-    input_col1, input_col2 = st.columns(2)
-    with input_col1:
-        user_id_input = st.text_input(
-            "아이디",
-            value=settings.user_id,
-            placeholder="사번 또는 아이디",
-            autocomplete="username",
-        )
-    with input_col2:
-        user_password_input = st.text_input(
-            "비밀번호",
-            value=settings.user_password,
-            type="password",
-            placeholder="비밀번호",
-            autocomplete="current-password",
-        )
-    st.caption("입력값은 현재 실행 세션에서만 사용됩니다. 로그에는 비밀번호를 저장하지 않습니다.")
+    if "account_sync_state" not in st.session_state:
+        st.session_state.account_sync_state = {}
+    if "account_user_id_input" not in st.session_state:
+        st.session_state.account_user_id_input = settings.user_id
+    if "account_user_password_input" not in st.session_state:
+        st.session_state.account_user_password_input = settings.user_password
+
+    st.subheader("계정 동기화")
+    with st.form("account_sync_form", clear_on_submit=False):
+        input_col1, input_col2 = st.columns(2)
+        with input_col1:
+            st.text_input(
+                "아이디",
+                key="account_user_id_input",
+                placeholder="사번 또는 아이디",
+                autocomplete="username",
+            )
+        with input_col2:
+            st.text_input(
+                "비밀번호",
+                key="account_user_password_input",
+                type="password",
+                placeholder="비밀번호",
+                autocomplete="current-password",
+            )
+        st.caption("Enter 또는 로그인/동기화 버튼으로 계정을 동기화한 뒤 Start를 눌러주세요.")
+        login_sync_clicked = st.form_submit_button("로그인/동기화", type="primary", width='stretch')
+
+    current_user_id_input = str(st.session_state.get("account_user_id_input", "")).strip()
+    current_user_password_input = str(st.session_state.get("account_user_password_input", ""))
+    sync_state_raw = st.session_state.get("account_sync_state", {})
+    sync_state = dict(sync_state_raw) if isinstance(sync_state_raw, dict) else {}
+
+    if login_sync_clicked:
+        if not current_user_id_input or not current_user_password_input:
+            st.session_state.account_sync_state = {}
+            sync_state = {}
+            st.error("ID/PW를 입력한 뒤 로그인/동기화를 눌러주세요.")
+        else:
+            sync_owner_key = _account_owner_key(current_user_id_input, viewer_id, _owner_key_secret(settings))
+            sync_owner_label = _account_owner_label(current_user_id_input, viewer_id)
+            sync_state = {
+                "user_id": current_user_id_input,
+                "user_password": current_user_password_input,
+                "owner_key": sync_owner_key,
+                "owner_label": sync_owner_label,
+                "synced_at": _utc_now_iso(),
+            }
+            st.session_state.account_sync_state = sync_state
+            append_log(f"[SYNC] 계정 동기화 완료: {sync_owner_label}")
+            active_job = queue_manager.find_active_job(owner=sync_owner_key)
+            if active_job is not None and str(active_job.get("job_id", "")).strip():
+                st.session_state.selected_job_id = str(active_job.get("job_id", ""))
+                st.success(
+                    "계정 동기화 완료. "
+                    f"실행 중 작업 id={active_job.get('job_id', '-')}, status={active_job.get('status', '-')}"
+                )
+            else:
+                latest_jobs = queue_manager.list_jobs(limit=1, owner=sync_owner_key, include_logs=False)
+                if latest_jobs:
+                    latest_job = latest_jobs[0]
+                    latest_job_id = str(latest_job.get("job_id", "")).strip()
+                    if latest_job_id:
+                        st.session_state.selected_job_id = latest_job_id
+                    st.success(
+                        "계정 동기화 완료. "
+                        f"최근 작업 id={latest_job.get('job_id', '-')}, status={latest_job.get('status', '-')}"
+                    )
+                else:
+                    st.success("계정 동기화 완료. 현재 계정의 기존 작업이 없습니다.")
+
+    sync_ready = (
+        bool(sync_state.get("user_id", "").strip())
+        and bool(str(sync_state.get("user_password", "")))
+        and bool(sync_state.get("owner_key", "").strip())
+    )
+
+    if is_admin:
+        user_id_input = current_user_id_input
+        user_password_input = current_user_password_input
+    elif sync_ready:
+        user_id_input = str(sync_state.get("user_id", "")).strip()
+        user_password_input = str(sync_state.get("user_password", ""))
+    else:
+        user_id_input = current_user_id_input
+        user_password_input = current_user_password_input
 
     if is_admin:
         show_browser = st.checkbox(
@@ -1037,12 +1105,23 @@ def main() -> None:
         exam_auto_retry_max=exam_auto_retry_max,
         exam_retry_requires_answer_index=exam_retry_requires_answer_index,
     )
-    queue_owner_key = _account_owner_key(task_settings.user_id, viewer_id, _owner_key_secret(settings))
-    queue_owner_label = _account_owner_label(task_settings.user_id, viewer_id)
-    if task_settings.user_id:
-        st.caption(f"큐 계정 식별자: {queue_owner_label}")
+    if not is_admin and sync_ready:
+        queue_owner_key = str(sync_state.get("owner_key", "")).strip()
+        queue_owner_label = str(sync_state.get("owner_label", "")).strip() or _account_owner_label(task_settings.user_id, viewer_id)
     else:
-        st.warning("아이디가 비어 있어 익명 세션 큐로 처리됩니다. 브라우저 재접속 시 작업 추적이 끊길 수 있습니다.")
+        queue_owner_key = _account_owner_key(task_settings.user_id, viewer_id, _owner_key_secret(settings))
+        queue_owner_label = _account_owner_label(task_settings.user_id, viewer_id)
+
+    if is_admin:
+        if task_settings.user_id:
+            st.caption(f"큐 계정 식별자: {queue_owner_label}")
+        else:
+            st.warning("아이디가 비어 있어 익명 세션 큐로 처리됩니다. 브라우저 재접속 시 작업 추적이 끊길 수 있습니다.")
+    else:
+        if sync_ready:
+            st.caption(f"동기화된 계정: {queue_owner_label}")
+        else:
+            st.warning("ID/PW 입력 후 Enter 또는 로그인/동기화를 눌러 계정을 먼저 동기화하세요.")
 
     if is_admin:
         st.subheader("설정 확인")
@@ -1098,10 +1177,12 @@ def main() -> None:
         )
 
     one_click_button_label = "원클릭 전체 자동 실행 (인덱스 확인 → 수료 자동)" if is_admin else "START"
+    one_click_disabled = (not is_admin) and (not sync_ready)
     run_one_click = st.button(
         one_click_button_label,
         type="primary",
         width='stretch',
+        disabled=one_click_disabled,
     )
 
     run_login = False
