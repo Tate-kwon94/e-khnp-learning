@@ -73,7 +73,8 @@ def _verify_code(input_code: str, plain_code: str, code_hash: str) -> bool:
         digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
         return hmac.compare_digest(digest, code_hash)
     if plain_code:
-        return hmac.compare_digest(candidate, plain_code)
+        # compare_digest(str, str)는 비ASCII 입력에서 TypeError를 낼 수 있어 bytes 비교로 통일
+        return hmac.compare_digest(candidate.encode("utf-8"), str(plain_code).encode("utf-8"))
     return True
 
 
