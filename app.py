@@ -702,15 +702,9 @@ def _render_live_queue_and_logs_fragment(
 def _render_system_flow_diagram(start_label: str) -> None:
     st.caption("시스템 전체 동작도")
     _ = start_label
-    compact = st.toggle(
-        "도식 압축 보기",
-        value=True,
-        key="flow_compact_mode",
-        help="켜면 도식을 작은 공간에 맞춰 표시합니다.",
-    )
-    max_width = 760 if compact else 900
-    font_size = "11px" if compact else "12px"
-    comp_height = 700 if compact else 980
+    max_width = 760
+    font_size = "11px"
+    comp_height = 700
     mermaid_code = """
 flowchart TB
   subgraph S1["1단계: 계정 동기화"]
