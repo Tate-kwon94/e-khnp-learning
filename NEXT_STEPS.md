@@ -65,6 +65,14 @@ Last updated: 2026-03-11
     - 장시간 학습시간 보충 대기를 chunk 방식으로 분할하고, 팝업 종료 감지 시 자동 재오픈
     - 시험/학습 `다음` 버튼에서 화살표(`>`, `›`, `→`, `aria-label=next`) 패턴 추가 인식
     - 수료 워크플로우 예외 시 `artifacts/player_debug/*` 디버그 산출물 자동 저장 강화
+  - 최적화/보안 점검:
+    - 큐 목록 조회 시 기본 로그 페이로드 제외(`include_logs=False`)로 관리자/사용자 상태 화면 렌더 부하 감소
+    - `datetime.utcnow()` 제거 및 UTC aware timestamp 적용(파이썬 3.14 deprecation 정리)
+    - Streamlit `use_container_width` 전면 치환(`width='stretch'/'content'`)으로 경고 로그 제거
+    - 관리자 잠금해제 실패 횟수 제한/쿨다운 추가(`APP_ADMIN_MAX_ATTEMPTS`, `APP_ADMIN_COOLDOWN_SEC`)
+    - 보안 로그/가드 파일/작업 스냅샷 파일 권한을 `0600`으로 강제
+    - URL 요청 보강: `urlopen` 호출 전 `http/https` 스킴 검증 적용
+    - 보안 스캔(Bandit) 재점검: High 0건, Medium 0건 확인
 
 ## 마일스톤 (업데이트)
 - M1 프로젝트 골격: 100% 완료

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 import html
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -29,11 +30,25 @@ RUNTIME_DIR.mkdir(exist_ok=True)
 ACCESS_GUARD_FILE = RUNTIME_DIR / "access_guard.json"
 ACCESS_GUARD_LOCK = threading.Lock()
 ACCESS_GUARD = {"fail_count": 0, "lock_until": 0.0}
+ADMIN_GUARD_FILE = RUNTIME_DIR / "admin_guard.json"
+ADMIN_GUARD_LOCK = threading.Lock()
+ADMIN_GUARD = {"fail_count": 0, "lock_until": 0.0}
 SECRET_PATTERNS = [
     re.compile(r"(?i)(password|passwd|비밀번호)\s*[:=]\s*([^\s,;]+)"),
     re.compile(r"(?i)(access_code|접속코드)\s*[:=]\s*([^\s,;]+)"),
 ]
 SESSION_LOG_MAX_LINES = 1500
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _restrict_file_permissions(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except Exception:  # noqa: BLE001
+        return
 
 
 def append_log(message: str) -> None:
@@ -80,6 +95,7 @@ def _load_access_guard_state() -> dict[str, float]:
 
 def _save_access_guard_state(state: dict[str, float]) -> None:
     ACCESS_GUARD_FILE.write_text(json.dumps(state, ensure_ascii=True), encoding="utf-8")
+    _restrict_file_permissions(ACCESS_GUARD_FILE)
 
 
 def _read_access_guard(now_ts: float) -> tuple[int, int]:
@@ -124,16 +140,76 @@ def _reset_access_guard() -> None:
         ACCESS_GUARD["lock_until"] = state["lock_until"]
 
 
+def _load_admin_guard_state() -> dict[str, float]:
+    if not ADMIN_GUARD_FILE.exists():
+        return {"fail_count": 0, "lock_until": 0.0}
+    try:
+        raw = json.loads(ADMIN_GUARD_FILE.read_text(encoding="utf-8"))
+        fail_count = int(raw.get("fail_count", 0))
+        lock_until = float(raw.get("lock_until", 0.0))
+        return {"fail_count": max(0, fail_count), "lock_until": max(0.0, lock_until)}
+    except Exception:  # noqa: BLE001
+        return {"fail_count": 0, "lock_until": 0.0}
+
+
+def _save_admin_guard_state(state: dict[str, float]) -> None:
+    ADMIN_GUARD_FILE.write_text(json.dumps(state, ensure_ascii=True), encoding="utf-8")
+    _restrict_file_permissions(ADMIN_GUARD_FILE)
+
+
+def _read_admin_guard(now_ts: float) -> tuple[int, int]:
+    with ADMIN_GUARD_LOCK:
+        state = _load_admin_guard_state()
+        ADMIN_GUARD["fail_count"] = state["fail_count"]
+        ADMIN_GUARD["lock_until"] = state["lock_until"]
+        fail_count = int(state["fail_count"])
+        lock_remaining = int(max(0, float(state["lock_until"]) - now_ts))
+        return fail_count, lock_remaining
+
+
+def _record_admin_failure(now_ts: float, max_attempts: int, cooldown_sec: int) -> tuple[int, int]:
+    with ADMIN_GUARD_LOCK:
+        state = _load_admin_guard_state()
+        lock_until = float(state["lock_until"])
+        if lock_until > now_ts:
+            return 0, int(lock_until - now_ts)
+
+        fail_count = int(state["fail_count"]) + 1
+        if fail_count >= max_attempts:
+            state["fail_count"] = 0
+            state["lock_until"] = now_ts + cooldown_sec
+            _save_admin_guard_state(state)
+            ADMIN_GUARD["fail_count"] = state["fail_count"]
+            ADMIN_GUARD["lock_until"] = state["lock_until"]
+            return 0, cooldown_sec
+
+        state["fail_count"] = fail_count
+        _save_admin_guard_state(state)
+        ADMIN_GUARD["fail_count"] = state["fail_count"]
+        ADMIN_GUARD["lock_until"] = state["lock_until"]
+        remaining_attempts = max_attempts - fail_count
+        return remaining_attempts, 0
+
+
+def _reset_admin_guard() -> None:
+    with ADMIN_GUARD_LOCK:
+        state = {"fail_count": 0, "lock_until": 0.0}
+        _save_admin_guard_state(state)
+        ADMIN_GUARD["fail_count"] = state["fail_count"]
+        ADMIN_GUARD["lock_until"] = state["lock_until"]
+
+
 def _audit_security_event(settings: Settings, event: str, **details: Any) -> None:
     if not settings.app_security_audit_enabled:
         return
     payload = {
-        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "ts": _utc_now_iso(),
         "event": event,
         "details": details,
     }
     with AUDIT_LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    _restrict_file_permissions(AUDIT_LOG_FILE)
 
 
 def _collect_secret_values(task_settings: Settings) -> list[str]:
@@ -141,6 +217,8 @@ def _collect_secret_values(task_settings: Settings) -> list[str]:
         task_settings.user_password,
         task_settings.app_access_code,
         task_settings.app_access_code_hash,
+        task_settings.app_admin_code,
+        task_settings.app_admin_code_hash,
     ]
     return [v for v in values if isinstance(v, str) and v]
 
@@ -166,11 +244,24 @@ def _safe_log_fn(task_settings: Settings, log_fn: Callable[[str], None]) -> Call
     return _wrapped
 
 
-def _account_owner_key(user_id: str, fallback_viewer_id: str) -> str:
+def _owner_key_secret(settings: Settings) -> str:
+    candidates = [
+        str(settings.app_access_code_hash or "").strip(),
+        str(settings.app_admin_code_hash or "").strip(),
+        str(settings.app_access_code or "").strip(),
+        str(settings.app_admin_code or "").strip(),
+    ]
+    for token in candidates:
+        if token:
+            return token
+    return "khnp-owner-v1"
+
+
+def _account_owner_key(user_id: str, fallback_viewer_id: str, secret: str) -> str:
     normalized = re.sub(r"\s+", "", str(user_id or "").strip()).lower()
     if not normalized:
         return f"anon:{fallback_viewer_id}"
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    digest = hmac.new(secret.encode("utf-8"), normalized.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
     return f"acct:{digest}"
 
 
@@ -433,7 +524,7 @@ def _render_queue_status(
                 for row in owner_rows
             ]
             st.caption("계정별 큐 현황")
-            st.dataframe(table_rows, use_container_width=True, hide_index=True)
+            st.dataframe(table_rows, width='stretch', hide_index=True)
 
             owner_options = ["__all__"] + [str(row.get("owner", "")) for row in owner_rows]
             owner_labels = {
@@ -464,9 +555,9 @@ def _render_queue_status(
     with left:
         st.caption("실행은 워커에서 순차 처리됩니다. 브라우저 탭을 닫아도 서버에서 계속 진행됩니다.")
     with right:
-        st.button("상태 새로고침", use_container_width=True)
+        st.button("상태 새로고침", width='stretch')
 
-    jobs = queue_manager.list_jobs(limit=50, owner=owner_filter)
+    jobs = queue_manager.list_jobs(limit=50, owner=owner_filter, include_logs=False)
     if not jobs:
         st.info("등록된 작업이 없습니다.")
         return has_active_jobs
@@ -481,7 +572,7 @@ def _render_queue_status(
     def _render_retry_button(job: dict[str, Any], button_key: str) -> None:
         if str(job.get("status")) != "failed":
             return
-        if st.button("실패 작업 재시도", key=button_key, use_container_width=False):
+        if st.button("실패 작업 재시도", key=button_key, width='content'):
             owner_key = str(job.get("owner") or "").strip()
             if owner_key:
                 active = queue_manager.find_active_job(owner=owner_key)
@@ -513,6 +604,9 @@ def _render_queue_status(
 
     if compact:
         current_job = next((job for job in jobs if job.get("status") in {"pending", "running"}), jobs[0])
+        current_job_detail = queue_manager.get_job(str(current_job.get("job_id", "")), owner=owner_filter, include_logs=True)
+        if current_job_detail:
+            current_job = current_job_detail
         st.caption(
             f"현재 작업: {current_job.get('name', '-')}"
             f" / 상태: {current_job.get('status', '-')}"
@@ -551,7 +645,7 @@ def _render_queue_status(
         }
         for job in jobs
     ]
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width='stretch', hide_index=True)
 
     job_ids = [job["job_id"] for job in jobs]
     default_job_id = st.session_state.get("selected_job_id")
@@ -561,7 +655,7 @@ def _render_queue_status(
     selected_job_id = st.selectbox("상세 작업", options=job_ids, index=selected_index)
     st.session_state.selected_job_id = selected_job_id
 
-    job = queue_manager.get_job(selected_job_id, owner=owner)
+    job = queue_manager.get_job(selected_job_id, owner=owner_filter, include_logs=True)
     if not job:
         st.warning("선택한 작업 정보를 읽지 못했습니다.")
         return has_active_jobs
@@ -637,7 +731,7 @@ def main() -> None:
             placeholder="관리자에게 문의하세요",
             disabled=lock_remaining > 0,
         )
-        if st.button("입장", type="primary", use_container_width=True, disabled=lock_remaining > 0):
+        if st.button("입장", type="primary", width='stretch', disabled=lock_remaining > 0):
             if _verify_access_code(access_code_input, settings):
                 st.session_state.access_granted = True
                 st.session_state.access_auth_ts = now_ts
@@ -706,24 +800,49 @@ def main() -> None:
 
     if is_admin:
         admin_enabled = bool(settings.app_admin_code or settings.app_admin_code_hash)
+        admin_max_attempts = max(1, settings.app_admin_max_attempts)
+        admin_cooldown_sec = max(30, settings.app_admin_cooldown_sec)
         if not admin_enabled:
             st.error("관리자 코드가 설정되지 않았습니다. `.env`에 `APP_ADMIN_CODE` 또는 `APP_ADMIN_CODE_HASH`를 설정하세요.")
             st.stop()
         if not st.session_state.admin_unlocked:
+            _, admin_lock_remaining = _read_admin_guard(now_ts)
             admin_code_input = st.text_input("관리자 비밀번호", type="password", placeholder="관리자 코드")
-            if st.button("관리자 잠금 해제", type="primary", use_container_width=True):
+            if st.button("관리자 잠금 해제", type="primary", width='stretch', disabled=admin_lock_remaining > 0):
                 if _verify_code(admin_code_input, settings.app_admin_code, settings.app_admin_code_hash):
                     st.session_state.admin_unlocked = True
+                    _reset_admin_guard()
                     _audit_security_event(settings, "admin_unlock_success")
                     st.rerun()
-                _audit_security_event(settings, "admin_unlock_failed")
-                st.error("관리자 비밀번호가 올바르지 않습니다.")
+                remaining_attempts, new_lock_remaining = _record_admin_failure(
+                    now_ts,
+                    admin_max_attempts,
+                    admin_cooldown_sec,
+                )
+                if new_lock_remaining > 0:
+                    _audit_security_event(
+                        settings,
+                        "admin_unlock_locked",
+                        cooldown_sec=new_lock_remaining,
+                        max_attempts=admin_max_attempts,
+                    )
+                    st.error(f"관리자 비밀번호 실패 횟수 초과로 {new_lock_remaining}초 잠금되었습니다.")
+                else:
+                    _audit_security_event(
+                        settings,
+                        "admin_unlock_failed",
+                        remaining_attempts=remaining_attempts,
+                        max_attempts=admin_max_attempts,
+                    )
+                    st.error(f"관리자 비밀번호가 올바르지 않습니다. 남은 시도 {remaining_attempts}회")
+            if admin_lock_remaining > 0:
+                st.warning(f"관리자 잠금 중입니다. {admin_lock_remaining}초 후 다시 시도하세요.")
             st.stop()
         top_col1, top_col2 = st.columns([4, 1])
         with top_col1:
             st.success("관리자 모드 잠금 해제됨")
         with top_col2:
-            if st.button("관리자 잠금", use_container_width=True):
+            if st.button("관리자 잠금", width='stretch'):
                 st.session_state.admin_unlocked = False
                 st.rerun()
 
@@ -928,7 +1047,7 @@ def main() -> None:
         exam_auto_retry_max=exam_auto_retry_max,
         exam_retry_requires_answer_index=exam_retry_requires_answer_index,
     )
-    queue_owner_key = _account_owner_key(task_settings.user_id, viewer_id)
+    queue_owner_key = _account_owner_key(task_settings.user_id, viewer_id, _owner_key_secret(settings))
     queue_owner_label = _account_owner_label(task_settings.user_id, viewer_id)
     if task_settings.user_id:
         st.caption(f"큐 계정 식별자: {queue_owner_label}")
@@ -944,6 +1063,8 @@ def main() -> None:
                 "app_access_code_set": bool(settings.app_access_code),
                 "app_access_code_hash_set": bool(settings.app_access_code_hash),
                 "app_admin_code_set": bool(settings.app_admin_code or settings.app_admin_code_hash),
+                "app_admin_max_attempts": admin_max_attempts,
+                "app_admin_cooldown_sec": admin_cooldown_sec,
                 "app_default_ui_role": settings.app_default_ui_role,
                 "app_force_ui_role": settings.app_force_ui_role,
                 "app_access_allow_open": settings.app_access_allow_open,
@@ -990,7 +1111,7 @@ def main() -> None:
     run_one_click = st.button(
         one_click_button_label,
         type="primary",
-        use_container_width=True,
+        width='stretch',
     )
 
     run_login = False
@@ -1004,23 +1125,23 @@ def main() -> None:
     if is_admin:
         col1, col2, col3, col4, col5, col6, col7, col8, col9 = st.columns(9)
         with col1:
-            run_login = st.button("로그인 테스트 실행", use_container_width=True)
+            run_login = st.button("로그인 테스트 실행", width='stretch')
         with col2:
-            run_learning_status = st.button("로그인 + 나의 학습현황 이동", use_container_width=True)
+            run_learning_status = st.button("로그인 + 나의 학습현황 이동", width='stretch')
         with col3:
-            run_first_course = st.button("첫 과목 학습 시작", use_container_width=True)
+            run_first_course = st.button("첫 과목 학습 시작", width='stretch')
         with col4:
-            run_complete_lesson = st.button("강의 순차 완료(첫 행→다음)", use_container_width=True)
+            run_complete_lesson = st.button("강의 순차 완료(첫 행→다음)", width='stretch')
         with col5:
-            run_exam_probe = st.button("종합평가 텍스트 탐침", use_container_width=True)
+            run_exam_probe = st.button("종합평가 텍스트 탐침", width='stretch')
         with col6:
-            run_completion_flow = st.button("수료 순서 자동(진도→시간→시험)", use_container_width=True)
+            run_completion_flow = st.button("수료 순서 자동(진도→시간→시험)", width='stretch')
         with col7:
-            run_rag_index = st.button("RAG 인덱스 생성", use_container_width=True)
+            run_rag_index = st.button("RAG 인덱스 생성", width='stretch')
         with col8:
-            run_exam_rag_solve = st.button("종합평가 LLM 풀이(RAG)", use_container_width=True)
+            run_exam_rag_solve = st.button("종합평가 LLM 풀이(RAG)", width='stretch')
         with col9:
-            if st.button("로그 초기화", use_container_width=True):
+            if st.button("로그 초기화", width='stretch'):
                 st.session_state.logs = []
 
     if stop_mode_label.startswith("자동"):

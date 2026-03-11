@@ -22,9 +22,16 @@ class SolveResult:
     evidence_ids: list[str]
 
 
+def _is_safe_http_url(url: str) -> bool:
+    parsed = urlparse(str(url or "").strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
 class OllamaClient:
     def __init__(self, base_url: str = "http://127.0.0.1:11434") -> None:
         self.base_url = base_url.rstrip("/")
+        if not _is_safe_http_url(self.base_url):
+            raise ValueError(f"Ollama base URL must be http/https: {base_url}")
 
     def embed(self, model: str, text: str) -> list[float]:
         payload = {"model": model, "prompt": text}
@@ -36,7 +43,7 @@ class OllamaClient:
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=120) as resp:  # noqa: S310
+            with request.urlopen(req, timeout=120) as resp:  # noqa: S310  # nosec B310
                 body = json.loads(resp.read().decode("utf-8"))
         except error.URLError as exc:
             raise RuntimeError(f"Ollama embedding call failed: {exc}") from exc
@@ -60,7 +67,7 @@ class OllamaClient:
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=180) as resp:  # noqa: S310
+            with request.urlopen(req, timeout=180) as resp:  # noqa: S310  # nosec B310
                 body = json.loads(resp.read().decode("utf-8"))
         except error.URLError as exc:
             raise RuntimeError(f"Ollama generate call failed: {exc}") from exc
@@ -278,7 +285,7 @@ class RagExamSolver:
 
         hits: list[dict[str, str]] = []
         try:
-            with request.urlopen(req, timeout=self.web_timeout_sec) as resp:  # noqa: S310
+            with request.urlopen(req, timeout=self.web_timeout_sec) as resp:  # noqa: S310  # nosec B310
                 page_html = resp.read().decode("utf-8", errors="ignore")
         except Exception:  # noqa: BLE001
             self._web_cache[key] = []
@@ -311,7 +318,7 @@ class RagExamSolver:
                         href = decoded
                 except Exception:  # noqa: BLE001
                     pass
-            if not href.startswith("http"):
+            if not _is_safe_http_url(href):
                 continue
 
             title = self._clean_html_text(raw_title)
@@ -349,7 +356,7 @@ class RagExamSolver:
             method="GET",
         )
         try:
-            with request.urlopen(alt_req, timeout=self.web_timeout_sec) as resp:  # noqa: S310
+            with request.urlopen(alt_req, timeout=self.web_timeout_sec) as resp:  # noqa: S310  # nosec B310
                 alt_html = resp.read().decode("utf-8", errors="ignore")
         except Exception:  # noqa: BLE001
             self._web_cache[alt_key] = []
@@ -380,7 +387,7 @@ class RagExamSolver:
                         href = decoded
                 except Exception:  # noqa: BLE001
                     pass
-            if not href.startswith("http"):
+            if not _is_safe_http_url(href):
                 continue
             title = self._clean_html_text(raw_title)
             snippet = self._clean_html_text(alt_snippets[idx] if idx < len(alt_snippets) else "")

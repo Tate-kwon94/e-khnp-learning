@@ -33,6 +33,8 @@ class Settings:
     app_access_code_hash: str = os.getenv("APP_ACCESS_CODE_HASH", "").strip().lower()
     app_admin_code: str = os.getenv("APP_ADMIN_CODE", "")
     app_admin_code_hash: str = os.getenv("APP_ADMIN_CODE_HASH", "").strip().lower()
+    app_admin_max_attempts: int = int(os.getenv("APP_ADMIN_MAX_ATTEMPTS", "5"))
+    app_admin_cooldown_sec: int = int(os.getenv("APP_ADMIN_COOLDOWN_SEC", "300"))
     app_default_ui_role: str = os.getenv("APP_DEFAULT_UI_ROLE", "user").strip().lower()
     app_force_ui_role: str = os.getenv("APP_FORCE_UI_ROLE", "").strip().lower()
     app_access_allow_open: bool = _env_bool("APP_ACCESS_ALLOW_OPEN", "false")

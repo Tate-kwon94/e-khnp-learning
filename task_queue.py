@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import queue
 import threading
@@ -12,6 +13,17 @@ from typing import Any, Callable
 
 
 RunnerFn = Callable[[Callable[[str], None]], dict[str, Any]]
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _restrict_file_permissions(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except Exception:  # noqa: BLE001
+        return
 
 
 @dataclass
@@ -78,8 +90,8 @@ class TaskQueueManager:
         owner_label: str | None = None,
         role: str | None = None,
     ) -> str:
-        now = datetime.utcnow()
-        now_iso = now.isoformat(timespec="seconds") + "Z"
+        now = datetime.now(UTC)
+        now_iso = now.isoformat(timespec="seconds").replace("+00:00", "Z")
         now_ts = now.timestamp()
         job_id = uuid.uuid4().hex[:12]
         job = Job(
@@ -101,7 +113,7 @@ class TaskQueueManager:
                     f"큐 대기 한도 초과: 현재 {pending_or_running}개, 한도 {self.max_pending}개"
                 )
             self._prune_jobs_unlocked()
-            now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            now_iso = _utc_now_iso()
             if running_now >= self.worker_count:
                 job.logs.append(
                     f"[{now_iso}] 대기열 등록: 실행 슬롯 사용중({running_now}/{self.worker_count}), 대기 {pending_now + 1}건"
@@ -181,22 +193,22 @@ class TaskQueueManager:
             role=role if role is not None else orig_role,
         )
 
-    def list_jobs(self, limit: int = 20, owner: str | None = None) -> list[dict[str, Any]]:
+    def list_jobs(self, limit: int = 20, owner: str | None = None, include_logs: bool = True) -> list[dict[str, Any]]:
         with self._lock:
             jobs = self._jobs.values()
             if owner is not None:
                 jobs = [j for j in jobs if j.owner == owner]
             jobs = sorted(jobs, key=lambda j: j.created_ts, reverse=True)
-            return [self._snapshot(job) for job in jobs[: max(1, limit)]]
+            return [self._snapshot(job, include_logs=include_logs) for job in jobs[: max(1, limit)]]
 
-    def get_job(self, job_id: str, owner: str | None = None) -> dict[str, Any] | None:
+    def get_job(self, job_id: str, owner: str | None = None, include_logs: bool = True) -> dict[str, Any] | None:
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
                 return None
             if owner is not None and job.owner != owner:
                 return None
-            return self._snapshot(job)
+            return self._snapshot(job, include_logs=include_logs)
 
     def get_stats(self, owner: str | None = None) -> dict[str, int]:
         with self._lock:
@@ -245,8 +257,8 @@ class TaskQueueManager:
                 self._queue.task_done()
 
     def _set_running(self, job_id: str) -> None:
-        now = datetime.utcnow()
-        now_iso = now.isoformat(timespec="seconds") + "Z"
+        now = datetime.now(UTC)
+        now_iso = now.isoformat(timespec="seconds").replace("+00:00", "Z")
         now_ts = now.timestamp()
         with self._lock:
             job = self._jobs.get(job_id)
@@ -265,8 +277,8 @@ class TaskQueueManager:
         error: str | None = None,
         tb: str | None = None,
     ) -> None:
-        now = datetime.utcnow()
-        now_iso = now.isoformat(timespec="seconds") + "Z"
+        now = datetime.now(UTC)
+        now_iso = now.isoformat(timespec="seconds").replace("+00:00", "Z")
         now_ts = now.timestamp()
         with self._lock:
             job = self._jobs.get(job_id)
@@ -294,7 +306,7 @@ class TaskQueueManager:
         self._persist_job_snapshot(snapshot)
 
     def _append_log(self, job_id: str, message: str) -> None:
-        now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        now_iso = _utc_now_iso()
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
@@ -327,10 +339,11 @@ class TaskQueueManager:
         try:
             path = self.history_dir / f"{snapshot.get('job_id', 'unknown')}.json"
             path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+            _restrict_file_permissions(path)
         except Exception:  # noqa: BLE001
             return
 
-    def _snapshot(self, job: Job) -> dict[str, Any]:
+    def _snapshot(self, job: Job, include_logs: bool = True) -> dict[str, Any]:
         return {
             "job_id": job.job_id,
             "name": job.name,
@@ -344,7 +357,7 @@ class TaskQueueManager:
             "owner": job.owner,
             "owner_label": job.owner_label,
             "role": job.role,
-            "logs": list(job.logs),
+            "logs": list(job.logs) if include_logs else [],
             "history_path": str((self.history_dir / f"{job.job_id}.json").as_posix()),
         }
 

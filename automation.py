@@ -3735,7 +3735,7 @@ class EKHNPAutomator:
             return ""
         q_toks = sorted(cls._token_set_from_norm(q_norm))
         base = " ".join(q_toks[:40]) if q_toks else q_norm[:220]
-        return hashlib.sha1(base.encode("utf-8")).hexdigest()
+        return hashlib.sha1(base.encode("utf-8"), usedforsecurity=False).hexdigest()
 
     @classmethod
     def _question_signature(cls, question: str) -> str:
@@ -3746,7 +3746,7 @@ class EKHNPAutomator:
         cleaned = sorted({str(x).strip() for x in option_norms if str(x).strip()})
         if not cleaned:
             return ""
-        return hashlib.sha1("|".join(cleaned[:8]).encode("utf-8")).hexdigest()
+        return hashlib.sha1("|".join(cleaned[:8]).encode("utf-8"), usedforsecurity=False).hexdigest()
 
     @classmethod
     def _option_set_signature(cls, options: list[str]) -> str:
@@ -3758,7 +3758,7 @@ class EKHNPAutomator:
         q = cls._normalize_question_text(question)
         opts = [cls._normalize_answer_text(x) for x in options if cls._normalize_answer_text(x)]
         base = f"q={q}||o={'|'.join(opts[:5])}"
-        return hashlib.sha1(base.encode("utf-8")).hexdigest()
+        return hashlib.sha1(base.encode("utf-8"), usedforsecurity=False).hexdigest()
 
     def _map_answer_option_norm_to_choice(
         self, answer_option_norm: str, current_option_norms: list[str]
@@ -4284,7 +4284,7 @@ class EKHNPAutomator:
         unique_texts: list[str] = []
         seen_hash: set[str] = set()
         for txt in texts:
-            h = hashlib.sha1(txt.encode("utf-8")).hexdigest()
+            h = hashlib.sha1(txt.encode("utf-8"), usedforsecurity=False).hexdigest()
             if h in seen_hash:
                 continue
             seen_hash.add(h)

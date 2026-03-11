@@ -11,6 +11,7 @@ from typing import Iterable
 from typing import Optional
 from urllib import error
 from urllib import request
+from urllib.parse import urlparse
 
 try:
     from pypdf import PdfReader  # type: ignore
@@ -100,9 +101,16 @@ def _pack_embedding_f16(values: list[float]) -> str:
     return base64.b64encode(packed).decode("ascii")
 
 
+def _is_safe_http_url(url: str) -> bool:
+    parsed = urlparse(str(url or "").strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
 class OllamaClient:
     def __init__(self, base_url: str = "http://127.0.0.1:11434") -> None:
         self.base_url = base_url.rstrip("/")
+        if not _is_safe_http_url(self.base_url):
+            raise ValueError(f"Ollama base URL must be http/https: {base_url}")
 
     def embed(self, model: str, text: str) -> list[float]:
         payload = {"model": model, "prompt": text}
@@ -114,7 +122,7 @@ class OllamaClient:
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=120) as resp:  # noqa: S310
+            with request.urlopen(req, timeout=120) as resp:  # noqa: S310  # nosec B310
                 body = json.loads(resp.read().decode("utf-8"))
         except error.URLError as exc:
             raise RuntimeError(f"Ollama embedding call failed: {exc}") from exc
@@ -239,7 +247,7 @@ def build_rag_index(
                 skipped_short += 1
                 continue
 
-            h = hashlib.sha1(clean.encode("utf-8")).hexdigest()
+            h = hashlib.sha1(clean.encode("utf-8"), usedforsecurity=False).hexdigest()
             if h in seen_text_hash:
                 skipped_dup += 1
                 continue
