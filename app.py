@@ -62,6 +62,7 @@ def append_log(message: str) -> None:
     logfile = LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.log"
     with logfile.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
+    _restrict_file_permissions(logfile)
 
 
 def _is_access_code_enabled(settings: Settings) -> bool:
@@ -380,39 +381,54 @@ def _run_one_click(
     if need_reindex:
         _run_rag_index(task_settings, safe_log)
 
-    first = _run_automator_method(
-        task_settings,
-        "login_and_run_completion_workflow",
-        safe_log,
-        check_interval_minutes=check_interval_minutes,
-        max_timefill_checks=max_timefill_checks,
-    )
-    if bool(first.get("success", False)):
-        return first
-
-    message = str(first.get("message", "")).lower()
+    max_resume_retry = max(0, min(4, int(getattr(task_settings, "app_resume_retry_max", 2) or 2)))
+    backoff_sec = max(0.0, min(20.0, float(getattr(task_settings, "app_resume_retry_backoff_sec", 2) or 2)))
     transient_tokens = [
         "target page",
         "browser has been closed",
         "context has been closed",
+        "page has been closed",
+        "세션",
+        "session",
+        "로그아웃",
+        "재로그인",
+        "login",
         "타임아웃",
         "timeout",
     ]
-    should_retry = any(token in message for token in transient_tokens)
-    if not should_retry:
-        return first
-
-    safe_log("원클릭 1차 실패 감지: 일시 오류로 판단되어 자동 재시도 1회를 진행합니다.")
-    second = _run_automator_method(
+    latest = _run_automator_method(
         task_settings,
         "login_and_run_completion_workflow",
         safe_log,
         check_interval_minutes=check_interval_minutes,
         max_timefill_checks=max_timefill_checks,
     )
-    if not bool(second.get("success", False)):
-        safe_log(f"원클릭 자동 재시도 실패: {second.get('message', '')}")
-    return second
+    for retry_idx in range(1, max_resume_retry + 1):
+        if bool(latest.get("success", False)):
+            return latest
+        message = str(latest.get("message", "")).lower()
+        should_retry = any(token in message for token in transient_tokens)
+        if not should_retry:
+            return latest
+        safe_log(
+            "원클릭 일시 오류 감지: 자동 재로그인/재결합 재시도 "
+            f"{retry_idx}/{max_resume_retry} (backoff={backoff_sec * retry_idx:.1f}s)"
+        )
+        if backoff_sec > 0:
+            time.sleep(backoff_sec * retry_idx)
+        latest = _run_automator_method(
+            task_settings,
+            "login_and_run_completion_workflow",
+            safe_log,
+            check_interval_minutes=check_interval_minutes,
+            max_timefill_checks=max_timefill_checks,
+        )
+        if bool(latest.get("success", False)):
+            safe_log(f"원클릭 자동 재결합 성공: retry={retry_idx}")
+            return latest
+    if not bool(latest.get("success", False)):
+        safe_log(f"원클릭 자동 재시도 최종 실패: {latest.get('message', '')}")
+    return latest
 
 
 def _enqueue_job(

@@ -16,7 +16,10 @@ Playwright + Streamlit 기반 e-khnp 수강 자동화 도구입니다.
   - `학습 진행현황` 버튼 미탐지 시 `학습 차시 1차시 학습하기` 직접 진입 fallback
   - 학습시간 부족 체크 주기 동적화(남은 시간 기준 3~10분)
 - OCR 폴백 활성화 완료: 서버에 `tesseract + kor` 데이터 설치 후 문항 OCR 경로 정상화
-- RAG 안정화: 저신뢰도 경계값(0.55) 비교 보정 + LLM JSON 파싱 관용성 강화
+- RAG 안정화: 저신뢰도 경계값(0.53) 비교 보정 + LLM JSON/텍스트 파싱 관용성 강화
+- 검색 고도화: `!g` 우선 + 법령형(`site:law.go.kr`) 교차검증 + 핵심구문(따옴표) 질의
+- 장애복구 보강: 브라우저 종료/세션 만료성 오류 시 자동 재로그인/재결합 재시도(`APP_RESUME_RETRY_MAX`)
+- 모델 운영: `qwen2.5:3b` 우선, `qwen2.5:7b` 폴백, `EEVE-Korean-10.8B` 보조 폴백 체인 적용
 - 2026-03-10 실주행 확인:
   - 원클릭 경로에서 `학습시간 보충용 학습창` 팝업 진입 성공
   - 학습시간 `00:05:08 -> 00:14:22` 증가 확인
@@ -61,10 +64,10 @@ Playwright + Streamlit 기반 e-khnp 수강 자동화 도구입니다.
 - M4 학습 재생/차시 완료 루프: `96%`
 - M5 수료 순서 자동화(진도→시간→시험): `95%`
 - M6 종합평가 자동화 안정화: `96%`
-- M7 LLM(RAG) 기반 시험풀이 고도화: `96%`
+- M7 LLM(RAG) 기반 시험풀이 고도화: `98%`
 - M8 원격 실행 서버화(Streamlit+Tunnel+Worker): `90%`
 - M9 동시성 제어(최대 5명)+대기열: `96%`
-- M10 운영(로그/모니터링/복구): `90%`
+- M10 운영(로그/모니터링/복구): `94%`
 
 ## 1) macOS(집 맥미니) 실행
 
@@ -96,6 +99,8 @@ APP_WORKER_COUNT=5
 APP_QUEUE_MAX_PENDING=20
 APP_QUEUE_MAX_HISTORY=200
 APP_SECURITY_AUDIT_ENABLED=true
+APP_RESUME_RETRY_MAX=2
+APP_RESUME_RETRY_BACKOFF_SEC=2
 EKHNP_USER_ID=사번
 EKHNP_USER_PASSWORD=비밀번호
 EKHNP_HEADLESS=false
@@ -210,6 +215,26 @@ python scripts/deferred_course_history_check.py \
   --report-path logs/deferred_course_history_check.json
 ```
 
+보안/성능 감사(로그 마스킹 + 워커5 부하) 리포트:
+
+```bash
+source .venv/bin/activate
+python scripts/security_perf_audit.py \
+  --report-path logs/security_perf_audit_report.json \
+  --queue-workers 5 --queue-jobs 25 --queue-sleep-sec 1.0
+```
+
+원클릭 전체 회귀 스모크(시간보충→시험→우회 마커 포함):
+
+```bash
+source .venv/bin/activate
+python scripts/full_regression_smoke.py \
+  --user-id "<ID>" --user-password "<PW>" \
+  --completion-max-courses 2 --check-interval-minutes 3 \
+  --max-timefill-checks 1 --safety-max-lessons 12 \
+  --report-path logs/full_smoke_report_latest.json
+```
+
 `APP_ACCESS_CODE_HASH` 생성 예시:
 
 ```bash
@@ -308,7 +333,9 @@ cloudflared tunnel run khnp-app
 ```bash
 # Ollama 설치 후 모델 받기
 ollama pull nomic-embed-text
+ollama pull anpigon/eeve-korean-10.8b
 ollama pull qwen2.5:7b
+ollama pull qwen2.5:3b
 ```
 
 `.env` 예시:
@@ -318,9 +345,11 @@ OLLAMA_BASE_URL=http://127.0.0.1:11434
 RAG_DOCS_DIR=rag_data
 RAG_INDEX_PATH=rag/index.json
 RAG_EMBED_MODEL=nomic-embed-text
-RAG_GENERATE_MODEL=qwen2.5:7b
+RAG_GENERATE_MODEL=qwen2.5:3b
+RAG_GENERATE_MODEL_FALLBACKS=qwen2.5:7b,anpigon/eeve-korean-10.8b
 RAG_TOP_K=6
-RAG_CONF_THRESHOLD=0.65
+RAG_CONF_THRESHOLD=0.62
+RAG_CONF_ESCALATE_MARGIN=0.08
 RAG_CHUNK_SIZE=900
 RAG_CHUNK_OVERLAP=150
 RAG_MIN_CHUNK_CHARS=80
@@ -328,11 +357,16 @@ RAG_MAX_CHUNKS=50000
 RAG_STORAGE_LIMIT_GB=20
 RAG_PRUNE_OLD_INDEXES=true
 RAG_PASS_SCORE=80
-RAG_LOW_CONF_FLOOR=0.55
+RAG_LOW_CONF_FLOOR=0.53
 RAG_WEB_SEARCH_ENABLED=true
 RAG_WEB_TOP_N=4
 RAG_WEB_TIMEOUT_SEC=8
 RAG_WEB_WEIGHT=0.35
+RAG_NEG_EVIDENCE_DECAY_SEC=7200
+RAG_NEG_EVIDENCE_MAX_SCORE=6.0
+RAG_NEG_EVIDENCE_BASE_PENALTY=0.18
+RAG_NEG_EVIDENCE_STEP_PENALTY=0.12
+RAG_NEG_EVIDENCE_MAX_PENALTY=0.75
 EXAM_ANSWER_BANK_PATH=rag/exam_answer_bank.json
 EXAM_DEFERRED_COURSES_PATH=.runtime/deferred_exam_courses.json
 EXAM_QUALITY_REPORT_DIR=logs/exam_quality_reports
@@ -352,19 +386,26 @@ COMPLETION_MAX_COURSES=20
 참고:
 
 - 신뢰도(`RAG 신뢰도 임계치`)보다 낮으면 자동풀이를 중단하도록 설계되었습니다.
-- 신뢰도 미달 시 재질문 1회를 추가 시도합니다.
-- 기본 신뢰도 임계치는 `0.65`(80점 운용 기준에서 안전 마진)이며 필요 시 조정하세요.
+- 신뢰도 미달 시 재질문 + self-check(모순 검토) 1회를 추가 시도합니다.
+- 저신뢰 문항은 생성 모델 체인(예: `qwen2.5:3b -> qwen2.5:7b -> eeve`)으로 교차검증하며, `RAG_CONF_ESCALATE_MARGIN` 이상 개선 시 상위 모델 답안을 채택합니다.
+- 숫자/기한/비율 문항은 Strict-Numerical-Check를 기본 적용하고, 7B+ 모델(또는 EEVE)로 숫자 일치 여부를 추가 재검증합니다.
+- 반복 오답 근거는 하드 차단 대신 Negative Evidence(문항별 soft penalty)로 점수 하향하며, 법령/조문 계열 근거는 보호합니다.
+- 기본 신뢰도 임계치는 `0.62`, 저신뢰 하한은 `0.53`(80점 운용 기준)입니다.
 - 보수 운용 기준은 `RAG_PASS_SCORE=80`으로 설정되어 저신뢰 문항 허용량을 자동 제한합니다.
-- 시험 문항 DOM 추출 실패 시 OCR 폴백을 시도합니다. (현재 운영 서버는 `tesseract + kor` 설치로 활성 상태)
+- 시험 보기 추출은 `Structured(셀렉터 기반) -> DOM 텍스트 -> OCR` 순으로 시도합니다. (현재 운영 서버는 `tesseract + kor` 설치로 OCR 활성 상태)
 - Ollama가 실행 중이 아니면 인덱싱/풀이가 실패합니다.
 - `EXAM_ATTEMPT_RESERVE=1`이면 각 강의당 마지막 1회 응시는 자동화에서 남겨둡니다.
 - 문항 풀이 시 웹 검색은 항상 참조되도록 고정되어 있습니다.
-- 웹 검색은 DuckDuckGo HTML 결과를 사용합니다(인터넷 연결 필요).
+- 웹 검색은 DuckDuckGo HTML을 사용하되 `!g` Bang 질의를 우선 시도합니다(인터넷 연결 필요).
+- 법령형 문항은 `site:law.go.kr` 교차검증 질의를 추가로 수행합니다.
 - `RAG_WEB_WEIGHT`는 로컬 RAG 점수와 웹 검색 점수 결합 비율입니다.
+- 부정형 문항(아닌/틀린/거리가 먼)은 웹 가중치를 동적으로 낮춰 잡음 영향을 줄입니다.
 - 점수 미달 시 결과지(`item result`)에서 정답을 추출해 `EXAM_ANSWER_BANK_PATH` 인덱스에 저장합니다.
 - 우회 강좌 이력은 `EXAM_DEFERRED_COURSES_PATH`에 저장되어 재시작 후에도 유지됩니다.
+- 우회 강좌 이력은 `EKHNP_USER_ID` 기준 계정 스코프로 분리 저장/조회되어, 다른 계정(다른 클라이언트)의 우회 목록이 섞이지 않습니다.
 - 시험 결과 파싱 품질 리포트(문항별 근거/신뢰도/정오)는 `EXAM_QUALITY_REPORT_DIR`에 JSON으로 저장됩니다.
 - 인덱스된 정답은 다음 응시에서 RAG보다 우선 적용됩니다.
+- 보기 순서 변경 매핑 점검은 `PYTHONPATH=. .venv/bin/python scripts/answer_bank_shuffle_check.py`로 검증할 수 있습니다.
 - `EXAM_AUTO_RETRY_MAX` 범위 내에서 자동 재응시를 수행합니다.
 - `EXAM_RETRY_REQUIRES_ANSWER_INDEX=true`면 정답 인덱싱 실패 시 재응시를 중단합니다.
 - `EXAM_RETRY_NO_IMPROVE_LIMIT`만큼 점수 비개선(동일/하락)이 연속되면 재응시를 조기 중단합니다.

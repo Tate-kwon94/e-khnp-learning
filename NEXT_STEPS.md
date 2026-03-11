@@ -4,8 +4,8 @@ Last updated: 2026-03-11
 
 ## 현재 스냅샷
 - 핵심 자동화(로그인, 강의실 진입, 차시 처리, 수료표 파싱)까지는 구현됨.
-- 종합평가는 팝업/문항 선택자 안정화와 실세션 E2E 검증이 남아있음.
-- 로컬 LLM(RAG, Ollama) 코드는 연결되었고 실제 문제풀이 정확도 검증이 필요함.
+- 종합평가는 팝업/문항 선택자 안정화는 완료, 실세션 점수/합격률 개선이 진행중.
+- 로컬 LLM(RAG, Ollama)은 운영 연동 완료, 모델/검색 전략 A/B 검증이 진행중.
 - 원격 실행(서버화) 및 동시 5명 제한은 운영 반영 단계로 진입:
   - 기본 워커 수 `APP_WORKER_COUNT=5` 반영
   - 5개 초과 작업 `pending` 대기열 전환 로그/검증 스크립트 추가
@@ -22,7 +22,7 @@ Last updated: 2026-03-11
   - 최종제출 후 완료 신호 감지 및 강의실 복귀 확인
   - 제출 결과 판독: `수료점수=fail`로 미수료 처리(의도대로 중단)
   - 응시횟수 재확인: 1/5 (남은 4회, reserve=1 유지)
-  - 운영 기준 업데이트: `RAG_CONF_THRESHOLD=0.65`, `RAG_PASS_SCORE=80`, `RAG_LOW_CONF_FLOOR=0.55`
+  - 운영 기준 업데이트: `RAG_CONF_THRESHOLD=0.62`, `RAG_PASS_SCORE=80`, `RAG_LOW_CONF_FLOOR=0.53`
   - 로컬 개인서버 용량 상한: `RAG_STORAGE_LIMIT_GB=20`
   - 선택지 클릭 검증 보강: `li.on`/`choiceAnswers` 기준으로 현재 문항 선택 여부 확인
   - 문항 전환 복구 보강: `문항 답변을 선택하지...` 경고 감지 시 재선택 후 다음 재시도
@@ -45,7 +45,7 @@ Last updated: 2026-03-11
     - 문항 정규화/시그니처(`question_match_norm`, `question_signature`) 인덱스 추가
     - 보기 순서 변경 불변 매칭(`option_set_signature`) 반영
   - 오답 반복 방지:
-    - 동일 근거 연속 실패(streak>=2) 시 근거 차단 후 2순위 근거 자동 전환
+    - 동일 근거 연속 실패(streak>=2) 시 Negative Evidence(soft penalty) 적용 + 2순위 근거 자동 전환
   - 우회 강좌 이력 영속화:
     - `.runtime/deferred_exam_courses.json` 로드/저장 추가(재시작 후 유지)
   - 시험 결과 파싱 품질 리포트:
@@ -83,6 +83,20 @@ Last updated: 2026-03-11
   - RAG 실패 패턴 완화:
     - `LLM JSON 파싱 실패`에 대한 관용 파서(ast/스마트쿼트/후행콤마) 반영
     - 저신뢰도 floor 비교를 반올림 게이트로 보정(표시값/실제값 불일치 완화)
+  - 검색/추론 고도화 2차:
+    - 핵심 키워드 가중(BM25 유사): 도메인 키워드/토큰 길이 가중 반영
+    - 부정형 문항(web_weight 동적 하향): `0.35 -> 0.18 cap`
+    - 저신뢰 self-check(모순 검토) 패스 추가
+    - `!g` 우선 + 법령형(`site:law.go.kr`) 교차검증 + 핵심구문 따옴표 쿼리 적용
+  - 모델 운영 고도화:
+    - 생성모델 체인 도입: `qwen2.5:3b(우선) -> qwen2.5:7b -> EEVE` 자동 폴백
+    - `.env.example`/README 운영 기본값 동기화
+    - EEVE 설치 후 스모크 A/B(4문항) 결과: `EEVE 0.50 < qwen7b 1.00 = qwen3b 1.00`
+  - 최적화/보안 강화 2차:
+    - 입력/쿼리 길이 상한, 제어문자 정리, 프롬프트 근거 길이 제한
+    - embed/web 캐시 상한 도입(메모리 보호)
+    - 모델 응답 파싱 길이 상한 도입
+    - 일일 로그 파일 권한 `0600` 강제
 
 ## 마일스톤 (업데이트)
 - M1 프로젝트 골격: 100% 완료
@@ -91,10 +105,10 @@ Last updated: 2026-03-11
 - M4 학습 재생/차시 완료 루프: 96% 완료
 - M5 수료 순서 자동화(진도→시간→시험): 95% 진행중
 - M6 종합평가 자동화 안정화: 96% 진행중
-- M7 LLM(RAG) 기반 시험풀이 고도화: 96% 진행중
+- M7 LLM(RAG) 기반 시험풀이 고도화: 98% 진행중
 - M8 원격 실행 서버화(Streamlit+Tunnel+Worker): 90% 진행중
 - M9 동시성 제어(최대 5명) + 대기열: 96% 진행중
-- M10 운영(로그/모니터링/복구): 90% 진행중
+- M10 운영(로그/모니터링/복구): 94% 진행중
 
 ## 완료된 작업
 - 로그인, `My학습포털 > 나의 학습현황` 이동.
@@ -197,24 +211,58 @@ Last updated: 2026-03-11
 - 재응시 제어 강화:
   - 재응시 직전 사유/점수 로그 출력
   - 점수 비개선(동일/하락) 연속 감지 시 조기 중단(`EXAM_RETRY_NO_IMPROVE_LIMIT`)
+- 문항/보기 추출 우선순위 조정:
+  - `Structured(셀렉터 기반) -> DOM -> OCR` 순서로 시도하도록 반영
+  - Structured 탐색은 지연 렌더링 대응을 위해 다회 시도(`attempts=2`) 추가
+- 저신뢰 교차검증 모델 스위칭:
+  - 1차/재질문 후 임계치 미달 시 폴백 모델(`qwen2.5:7b`, `EEVE`) 순차 검증
+  - `RAG_CONF_ESCALATE_MARGIN` 이상 신뢰도 개선 시 상위 모델 답안 채택
+- answer-bank 보기 셔플 재매핑 검증:
+  - `scripts/answer_bank_shuffle_check.py` 추가
+  - 실데이터 스모크: `trials=100, pass=100, fail=0`
+- 실세션 E2E 검증(2026-03-11 밤):
+  - `logs/completion_e2e_report_run1.json`:
+    - 1개 과정 우회(`remaining=2`) + 다음 과정 시험 자동진행 확인
+    - 저신뢰 모델 스위칭 실발동(`qwen2.5:7b`로 승격) 확인
+    - 3차 재응시에서 `conf=0.52 < floor=0.53`로 안전 중단
+  - `logs/completion_e2e_report_run2.json`:
+    - 우회 순서 패치 검증 성공: `remaining=2` 시점에서 즉시 과정 우회 후 3번째 과정 진입
+    - 장시간 차시 진행 중 정체 복구 로직 발동(디버그 스냅샷 저장 포함)
+    - 복구 중 `학습창 재오픈 실패` 케이스 확인(추가 보강 필요)
+- 임계치/마진 A/B 스윕:
+  - `scripts/conf_threshold_sweep.py` 추가
+  - 샘플셋(6문항) 스윕 결과: 현 구간(`th=0.58~0.65`, `margin=0.05~0.10`)에서 동일 지표
+    - `accuracy_accepted=0.8333`, `accept_rate=1.0`, `switched_count=0`
+- 우회 이력 계정 격리 패치:
+  - 전역 우회 이력 파일을 `user_id` 기반 `account_scope`로 분리 저장/로딩하도록 수정
+  - 다계정 격리 검증 스크립트 결과: `isolation_ok=true`
+- 숫자 문항 보정:
+  - Strict-Numerical-Check 기본 적용 + 7B+/EEVE 숫자 재검증 패스 추가
+  - 기한/비율/횟수/조문번호 숫자 불일치 시 confidence 상한(<=0.55) 보수 적용
+- 2026-03-11 운영/검증 추가:
+  - Negative Evidence 고도화: 감점값 시간감쇠(half-life) + 최대점수 cap + 법령근거 보호 + answer-bank 강차단 유지
+  - 숫자 검증 강화: LLM strict pass + 정규식 기반 deterministic numeric recheck 병행
+  - 장애복구 강화: 원클릭 일시 오류 시 자동 재로그인/재결합 다회 재시도(`APP_RESUME_RETRY_MAX`)
+  - 런타임 동기화/재시작 완료: `.khnp-launch-runtime` 해시 일치 + 8501/8502 헬스체크 200
+  - 성능/보안 감사 리포트: `logs/security_perf_audit_report.json` (`security_findings=0`, worker5 부하 통과)
+  - 큐 부하 최종 리포트: `logs/queue_load_report_final.json` (`max_running_observed=5`, `pending_seen=true`)
+  - 실계정 시험 진입 점검: `logs/exam_live_run_report1.json`, `logs/exam_live_run_report2.json` 모두 `학습진도율 75%(응시조건 미달)`로 시험 단계 미진입 확인
 
 ## 진행중 작업
-- `qwen2.5:7b-instruct` 모델 pull 완료 및 로컬 추론 응답 확인.
-- 종합평가 문항/보기 추출 품질 향상(특히 실문항 텍스트 정합성 개선).
+- `anpigon/eeve-korean-10.8b` 모델 다운로드 완료(설치됨). 운영 기본은 qwen 우선 체인으로 유지.
 - 종합평가 정답률 개선(외부 문서/사내 자료 인덱스 확대, 현재는 샘플 문서 편중).
-- 종합평가 LLM 응시 1회 실세션 E2E 완주 검증(신규 기준: conf=0.65, pass_score=80, 점수/합격 여부 포함).
-- 1차시 재생 유지 + 10분 간격 강의실 새로고침 체크 정밀화.
+- 종합평가 LLM 응시 실세션 E2E 합격률 검증(신규 기준: conf=0.62, pass_score=80).
 - OCR 정확도 튜닝(언어모델 `kor+eng`, psm 조합, 난독 케이스 재검증).
 
-## 정답률 개선 로직(다음 반영안)
-1. 문항 정규화 키 강화:
+## 정답률 개선 로직(추가 고도화 후보)
+1. 문항 정규화 키 강화(고도화):
    - 불필요한 기호/번호/순서 의존성을 제거한 `question_norm_v2`를 만들어
      동일문항 재등장 시 매칭률을 높임.
-2. 선택지 정렬 불변 매칭:
+2. 선택지 정렬 불변 매칭(고도화):
    - 보기 순서가 바뀌어도 의미 유사도(토큰/Jaccard + 부분문자열)로 정답 인덱스를 재매핑.
-3. 해설/정답지 우선순위 명시:
+3. 해설/정답지 우선순위 명시(고도화):
    - `answer-bank > 해설문서 > 일반 RAG > 웹검색` 고정 우선순위를 로그로 남겨 추적 가능화.
-4. 오답 회피 제어:
+4. 오답 회피 제어(고도화):
    - 연속 실패 문항은 동일 근거 반복 선택을 막고 2순위 근거 후보로 자동 전환.
 5. 시험 후 학습 피드백:
    - 결과지 파싱 시 정답뿐 아니라 오답 보기 패턴도 저장해 다음 회차에서 오답 선택 확률을 낮춤.

@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any, Callable, Optional
 
 from playwright.sync_api import Frame
@@ -51,11 +52,12 @@ class EKHNPAutomator:
         self._deferred_courses_path = Path(
             getattr(self.settings, "exam_deferred_courses_path", ".runtime/deferred_exam_courses.json")
         )
+        self._deferred_account_scope = self._build_deferred_account_scope()
         self._deferred_exam_course_history: dict[str, dict[str, Any]] = {}
         self._exam_quality_report_dir = Path(
             getattr(self.settings, "exam_quality_report_dir", "logs/exam_quality_reports")
         )
-        self._question_evidence_fail_streak: dict[str, dict[str, int]] = {}
+        self._question_evidence_fail_streak: dict[str, dict[str, Any]] = {}
         self._last_exam_solve_payload: dict[str, Any] = {}
         self._load_answer_bank()
         self._load_deferred_exam_courses()
@@ -96,8 +98,17 @@ class EKHNPAutomator:
         items = raw.get("items") if isinstance(raw, dict) else None
         if not isinstance(items, list):
             return
+        meta = raw.get("meta") if isinstance(raw, dict) else {}
+        meta_scope = str(meta.get("account_scope", "")).strip() if isinstance(meta, dict) else ""
         for row in items:
             if not isinstance(row, dict):
+                continue
+            row_scope = str(row.get("account_scope", "")).strip()
+            # 계정 스코프가 다르면 절대 로드하지 않습니다(다른 클라이언트/계정 이력 격리).
+            if row_scope and row_scope != self._deferred_account_scope:
+                continue
+            # 레거시(스코프 없음) 레코드는 meta.account_scope가 현재와 일치할 때만 제한적으로 허용.
+            if not row_scope and meta_scope != self._deferred_account_scope:
                 continue
             key = self._course_title_key(str(row.get("title", "")))
             if not key:
@@ -107,15 +118,44 @@ class EKHNPAutomator:
             title = str(row.get("title", "")).strip()
             reason = str(row.get("reason", "")).strip()
             updated_at = str(row.get("updated_at", "")).strip()
-            payload = {"key": key, "title": title, "reason": reason, "updated_at": updated_at}
+            payload = {
+                "key": key,
+                "title": title,
+                "reason": reason,
+                "updated_at": updated_at,
+                "account_scope": self._deferred_account_scope,
+            }
             self._deferred_exam_course_history[key] = payload
             self._deferred_exam_course_keys.add(key)
 
     def _save_deferred_exam_courses(self) -> None:
         try:
             self._deferred_courses_path.parent.mkdir(parents=True, exist_ok=True)
+            existing_rows: list[dict[str, Any]] = []
+            if self._deferred_courses_path.exists():
+                try:
+                    raw_prev = json.loads(self._deferred_courses_path.read_text(encoding="utf-8"))
+                    items_prev = raw_prev.get("items") if isinstance(raw_prev, dict) else None
+                    if isinstance(items_prev, list):
+                        for row in items_prev:
+                            if not isinstance(row, dict):
+                                continue
+                            row_scope = str(row.get("account_scope", "")).strip()
+                            if row_scope and row_scope != self._deferred_account_scope:
+                                existing_rows.append(dict(row))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            scoped_rows = []
+            for row in self._deferred_exam_course_history.values():
+                if not isinstance(row, dict):
+                    continue
+                merged_row = dict(row)
+                merged_row["account_scope"] = self._deferred_account_scope
+                scoped_rows.append(merged_row)
+
             rows = sorted(
-                self._deferred_exam_course_history.values(),
+                existing_rows + scoped_rows,
                 key=lambda x: str(x.get("updated_at", "")),
                 reverse=True,
             )
@@ -123,6 +163,8 @@ class EKHNPAutomator:
                 "meta": {
                     "updated_at": datetime.now().isoformat(timespec="seconds"),
                     "count": len(rows),
+                    "account_scope": self._deferred_account_scope,
+                    "scoped_count": len(scoped_rows),
                 },
                 "items": rows,
             }
@@ -280,6 +322,20 @@ class EKHNPAutomator:
     def _course_title_key(title: str) -> str:
         return re.sub(r"\s+", " ", str(title or "").strip()).lower()
 
+    @staticmethod
+    def _question_has_numeric_signal(question: str, options: list[str]) -> bool:
+        joined = f"{question} {' '.join(options[:5])}"
+        return bool(re.search(r"\d", joined))
+
+    def _build_deferred_account_scope(self) -> str:
+        user_id = re.sub(r"\s+", "", str(getattr(self.settings, "user_id", "") or "")).lower()
+        base_url = str(getattr(self.settings, "base_url", "") or "").strip().lower()
+        login_url = str(getattr(self.settings, "login_url", "") or "").strip().lower()
+        seed = f"{user_id}||{base_url}||{login_url}"
+        if not user_id:
+            return "anonymous"
+        return hashlib.sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:20]
+
     def _mark_current_course_exam_deferred(self, reason: str) -> None:
         title = str(self._last_opened_course_title or "").strip()
         if not title:
@@ -292,6 +348,7 @@ class EKHNPAutomator:
                 "title": title,
                 "reason": str(reason or "").strip(),
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "account_scope": self._deferred_account_scope,
             }
             self._save_deferred_exam_courses()
         self._log(f"과정 우회 등록: {title} / {reason}")
@@ -1527,6 +1584,21 @@ class EKHNPAutomator:
                                 classroom_page.url,
                             )
 
+                        skip_course = self._maybe_skip_course_on_low_exam_attempts(
+                            classroom_page=classroom_page,
+                            timefill_interval_minutes=base_timefill_interval_minutes,
+                            timefill_check_limit=check_limit,
+                        )
+                        if skip_course is not None:
+                            return skip_course
+                        attempt_guard = self._enforce_exam_attempt_reserve(classroom_page)
+                        if attempt_guard is not None:
+                            return LoginResult(
+                                False,
+                                f"{completion_guard.message} / {attempt_guard.message}",
+                                classroom_page.url,
+                            )
+
                         if retry_round >= max_exam_retries:
                             return LoginResult(
                                 False,
@@ -1545,21 +1617,6 @@ class EKHNPAutomator:
                             return LoginResult(
                                 False,
                                 f"{completion_guard.message} / 정답지 인덱싱 데이터가 없어 자동 재응시를 중단합니다.",
-                                classroom_page.url,
-                            )
-
-                        skip_course = self._maybe_skip_course_on_low_exam_attempts(
-                            classroom_page=classroom_page,
-                            timefill_interval_minutes=base_timefill_interval_minutes,
-                            timefill_check_limit=check_limit,
-                        )
-                        if skip_course is not None:
-                            return skip_course
-                        attempt_guard = self._enforce_exam_attempt_reserve(classroom_page)
-                        if attempt_guard is not None:
-                            return LoginResult(
-                                False,
-                                f"{completion_guard.message} / {attempt_guard.message}",
                                 classroom_page.url,
                             )
 
@@ -2903,7 +2960,7 @@ class EKHNPAutomator:
 
         self._log(f"종합평가 문항 탐침 시작 (최대 {max_questions}문항)")
         for _ in range(max_questions):
-            snap = self._extract_exam_question_snapshot(page)
+            snap = self._extract_exam_question_snapshot(page, allow_ocr=False, prefer_structured=True)
             if snap is None:
                 self._log("문항 텍스트 판독 실패: OCR 폴백 필요 가능성")
                 break
@@ -2949,14 +3006,94 @@ class EKHNPAutomator:
             "total_hint": total_hint,
         }
 
-    def _blocked_evidence_ids_for_question(self, question: str, min_streak: int = 2) -> set[str]:
+    @staticmethod
+    def _is_protected_evidence_id(evidence_id: str) -> bool:
+        src = str(evidence_id or "").strip().lower()
+        if not src:
+            return False
+        protected_tokens = (
+            "law.go.kr",
+            "국가법령정보센터",
+            "법령",
+            "시행령",
+            "시행규칙",
+            "조문",
+        )
+        return any(tok in src for tok in protected_tokens)
+
+    def _negative_evidence_decay_half_life_sec(self) -> float:
+        return max(300.0, float(getattr(self.settings, "rag_negative_evidence_decay_sec", 7200) or 7200))
+
+    @staticmethod
+    def _decode_negative_evidence_entry(entry: Any) -> tuple[float, float]:
+        if isinstance(entry, dict):
+            try:
+                score = float(entry.get("score", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001
+                score = 0.0
+            try:
+                updated_at = float(entry.get("updated_at", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001
+                updated_at = 0.0
+            return max(0.0, score), max(0.0, updated_at)
+        try:
+            score = float(entry or 0.0)
+        except Exception:  # noqa: BLE001
+            score = 0.0
+        return max(0.0, score), 0.0
+
+    def _decay_negative_evidence_score(self, score: float, updated_at: float, now_ts: float) -> float:
+        s = max(0.0, float(score))
+        ts = max(0.0, float(updated_at))
+        if s <= 0.0:
+            return 0.0
+        if ts <= 0.0 or now_ts <= ts:
+            return s
+        delta = max(0.0, now_ts - ts)
+        half_life = self._negative_evidence_decay_half_life_sec()
+        # 지수 감쇠: half-life 경과 시 점수를 절반으로 감소.
+        return s * (0.5 ** (delta / half_life))
+
+    def _negative_evidence_penalties_for_question(self, question: str, min_streak: int = 2) -> dict[str, float]:
         q_sig = self._question_signature(question)
         if not q_sig:
-            return set()
+            return {}
         slot = self._question_evidence_fail_streak.get(q_sig, {})
         if not isinstance(slot, dict):
-            return set()
-        return {str(eid).strip() for eid, streak in slot.items() if int(streak) >= int(min_streak) and str(eid).strip()}
+            return {}
+        now_ts = time.time()
+        max_score = max(1.0, float(getattr(self.settings, "rag_negative_evidence_max_score", 6.0) or 6.0))
+        base_penalty = max(
+            0.0,
+            min(0.95, float(getattr(self.settings, "rag_negative_evidence_base_penalty", 0.18) or 0.18)),
+        )
+        step_penalty = max(
+            0.0,
+            min(0.95, float(getattr(self.settings, "rag_negative_evidence_step_penalty", 0.12) or 0.12)),
+        )
+        max_penalty = max(
+            base_penalty,
+            min(0.95, float(getattr(self.settings, "rag_negative_evidence_max_penalty", 0.75) or 0.75)),
+        )
+        penalties: dict[str, float] = {}
+        for eid, raw_entry in list(slot.items()):
+            key = str(eid).strip()
+            if not key:
+                continue
+            score_raw, updated_at = self._decode_negative_evidence_entry(raw_entry)
+            score_decayed = self._decay_negative_evidence_score(score_raw, updated_at, now_ts)
+            score_decayed = min(max_score, max(0.0, score_decayed))
+            slot[key] = {"score": round(score_decayed, 4), "updated_at": now_ts}
+            if score_decayed < float(min_streak):
+                continue
+            if key == "answer-bank":
+                penalties[key] = 1.0
+                continue
+            if self._is_protected_evidence_id(key):
+                continue
+            # 반복 오답 근거는 soft penalty로 가중(차단 대신 순위 하향).
+            penalties[key] = min(max_penalty, base_penalty + step_penalty * max(0.0, score_decayed - float(min_streak)))
+        return penalties
 
     def _update_evidence_fail_history(
         self,
@@ -2994,11 +3131,22 @@ class EKHNPAutomator:
                 is_correct = any(bool(v) for v in correctness_values)
             else:
                 is_correct = not fallback_failed_all
+            now_ts = time.time()
+            max_score = max(1.0, float(getattr(self.settings, "rag_negative_evidence_max_score", 6.0) or 6.0))
             for eid in evidence_ids[:3]:
+                prev_score, prev_updated_at = self._decode_negative_evidence_entry(slot.get(eid, 0.0))
+                prev_score = self._decay_negative_evidence_score(prev_score, prev_updated_at, now_ts)
                 if is_correct:
-                    slot[eid] = 0
+                    slot[eid] = {"score": 0.0, "updated_at": now_ts}
                 else:
-                    slot[eid] = int(slot.get(eid, 0)) + 1
+                    try:
+                        conf = float(rec.get("confidence", 0.0) or 0.0)
+                    except Exception:  # noqa: BLE001
+                        conf = 0.0
+                    # 고신뢰 오답은 다음 회차에서 동일 근거를 더 강하게 감점합니다.
+                    penalty = 2 if conf >= 0.80 else 1
+                    next_score = min(max_score, max(0.0, prev_score) + float(penalty))
+                    slot[eid] = {"score": round(next_score, 4), "updated_at": now_ts}
 
     def _solve_exam_stream_with_rag(
         self,
@@ -3017,6 +3165,10 @@ class EKHNPAutomator:
         question_records: list[dict[str, Any]] = []
         pass_score = max(0, min(100, int(getattr(self.settings, "rag_pass_score", 80))))
         low_conf_floor = max(0.0, min(1.0, float(getattr(self.settings, "rag_low_conf_floor", 0.55))))
+        model_escalate_margin = max(
+            0.0,
+            min(0.35, float(getattr(self.settings, "rag_conf_escalate_margin", 0.08))),
+        )
         fallback_low_conf_budget = max(1, int(max_questions * 0.2))
 
         def _payload(success: bool, message: str) -> dict[str, Any]:
@@ -3034,6 +3186,7 @@ class EKHNPAutomator:
             "종합평가 RAG 자동풀이 시작 "
             f"(max={max_questions}, top_k={top_k}, conf>={confidence_threshold:.2f}, "
             f"pass_score={pass_score}, low_conf_floor={low_conf_floor:.2f}, "
+            f"model_escalate_margin={model_escalate_margin:.2f}, "
             f"web=always, web_top_n={self.settings.rag_web_top_n})"
         )
         exam_runtime_meta = self._extract_exam_runtime_meta(exam_page)
@@ -3044,7 +3197,18 @@ class EKHNPAutomator:
                 f"examPaperSeq={exam_runtime_meta.get('courseActiveExamPaperSeq', '')}"
             )
         for _ in range(max_questions):
-            snap = self._extract_exam_question_snapshot(exam_page)
+            snap = self._extract_exam_question_snapshot(
+                exam_page,
+                allow_ocr=False,
+                prefer_structured=True,
+            )
+            if snap is None:
+                snap = self._extract_exam_question_snapshot(
+                    exam_page,
+                    force_ocr=True,
+                    allow_ocr=True,
+                    prefer_structured=True,
+                )
             if snap is None:
                 return _payload(False, "문항 텍스트를 읽지 못했습니다.")
 
@@ -3067,10 +3231,14 @@ class EKHNPAutomator:
                 question = full_text
 
             if len(options) < 2:
-                for retry in range(3):
+                for retry in range(2):
                     if retry > 0:
                         exam_page.wait_for_timeout(1200)
-                    snap_retry = self._extract_exam_question_snapshot(exam_page, force_ocr=True)
+                    snap_retry = self._extract_exam_question_snapshot(
+                        exam_page,
+                        allow_ocr=False,
+                        prefer_structured=True,
+                    )
                     if snap_retry:
                         retry_options = [str(x).strip() for x in snap_retry.get("options", []) if str(x).strip()]
                         if len(retry_options) >= 2:
@@ -3079,24 +3247,69 @@ class EKHNPAutomator:
                                 snap_retry.get("full_text", "")
                             ).strip()
                             source = str(snap_retry.get("source", source))
-                    if len(options) < 2:
-                        structured_options = self._extract_exam_options_structured(exam_page)
-                        if len(structured_options) >= 2:
-                            options = structured_options
-                            source = f"{source}+structured"
                     if len(options) >= 2:
                         self._log(
-                            f"보기 추출 폴백 성공: retry={retry + 1}, source={source}, option_count={len(options)}"
+                            "보기 추출 폴백 성공: "
+                            f"retry={retry + 1}, stage=structured, source={source}, option_count={len(options)}"
                         )
                         break
                 if len(options) < 2:
+                    for retry in range(2):
+                        if retry > 0:
+                            exam_page.wait_for_timeout(1200)
+                        snap_retry = self._extract_exam_question_snapshot(
+                            exam_page,
+                            force_ocr=True,
+                            allow_ocr=True,
+                            prefer_structured=True,
+                        )
+                        if snap_retry:
+                            retry_options = [str(x).strip() for x in snap_retry.get("options", []) if str(x).strip()]
+                            if len(retry_options) >= 2:
+                                options = retry_options
+                                question = str(snap_retry.get("question_text", "")).strip() or str(
+                                    snap_retry.get("full_text", "")
+                                ).strip()
+                                source = str(snap_retry.get("source", source))
+                        if len(options) >= 2:
+                            self._log(
+                                "보기 추출 폴백 성공: "
+                                f"retry={retry + 1}, stage=ocr, source={source}, option_count={len(options)}"
+                            )
+                            break
+                if len(options) >= 2 and "structured" in source:
+                    self._log(
+                        f"보기 추출 1순위 적용: structured source={source}, option_count={len(options)}"
+                    )
+                if len(options) >= 2 and "structured" not in source and source.startswith("dom"):
+                    self._log(
+                        f"보기 추출 2순위 적용: dom source={source}, option_count={len(options)}"
+                    )
+                if len(options) >= 2 and "ocr" in source:
+                    self._log(
+                        f"보기 추출 3순위 적용: ocr source={source}, option_count={len(options)}"
+                    )
+                if len(options) < 2:
                     return _payload(False, f"보기 추출 실패(current/total={current}/{total}, source={source})")
 
-            blocked_evidence_ids = self._blocked_evidence_ids_for_question(question)
-            if blocked_evidence_ids:
+            numeric_question = self._question_has_numeric_signal(question, options)
+            strict_numeric_primary = numeric_question
+            negative_evidence_penalties = self._negative_evidence_penalties_for_question(question)
+            hard_excluded_evidence_ids = {
+                str(eid).strip()
+                for eid, penalty in negative_evidence_penalties.items()
+                if str(eid).strip() and float(penalty) >= 0.95
+            }
+            if negative_evidence_penalties:
+                sampled = sorted(
+                    (
+                        f"{eid}:{float(negative_evidence_penalties[eid]):.2f}"
+                        for eid in negative_evidence_penalties.keys()
+                    )
+                )[:3]
                 self._log(
-                    "연속 오답 근거 차단 적용: "
-                    f"Q {current}/{total} blocked={sorted(blocked_evidence_ids)[:3]}"
+                    "Negative Evidence 감점 적용: "
+                    f"Q {current}/{total} penalties={sampled}"
                 )
             cached_answer = self._lookup_answer_bank_choice(
                 question=question,
@@ -3104,7 +3317,7 @@ class EKHNPAutomator:
                 exam_meta=exam_runtime_meta,
             )
             used_answer_bank = False
-            if cached_answer is not None and "answer-bank" not in blocked_evidence_ids:
+            if cached_answer is not None and "answer-bank" not in hard_excluded_evidence_ids:
                 choice = int(cached_answer.get("choice", 0))
                 confidence = float(cached_answer.get("confidence", 0.98))
                 reason = str(cached_answer.get("reason", "answer-bank"))
@@ -3112,15 +3325,24 @@ class EKHNPAutomator:
                 used_answer_bank = True
                 self._log(f"정답 인덱스 매칭 사용: Q {current}/{total} -> choice={choice}, conf={confidence:.2f}")
             else:
-                if cached_answer is not None and "answer-bank" in blocked_evidence_ids:
+                if cached_answer is not None and "answer-bank" in hard_excluded_evidence_ids:
                     self._log(f"Q {current}/{total} answer-bank 연속 실패 감지로 2순위 근거 전환")
-                solve_top_k = max(int(top_k), int(top_k) + len(blocked_evidence_ids))
+                solve_top_k = max(int(top_k), int(top_k) + len(hard_excluded_evidence_ids))
+                model_chain = [str(x).strip() for x in getattr(solver, "generate_models", []) if str(x).strip()]
+                primary_model = model_chain[0] if model_chain else ""
+                if strict_numeric_primary:
+                    self._log(
+                        "숫자 문항 엄격 검증 적용: "
+                        f"Q {current}/{total}, primary={primary_model or 'unknown'}, high-capacity-review=enabled"
+                    )
                 try:
                     decision = solver.solve(
                         question=question,
                         options=options,
                         top_k=solve_top_k,
-                        exclude_evidence_ids=sorted(blocked_evidence_ids) if blocked_evidence_ids else None,
+                        exclude_evidence_ids=sorted(hard_excluded_evidence_ids) if hard_excluded_evidence_ids else None,
+                        evidence_penalties=negative_evidence_penalties if negative_evidence_penalties else None,
+                        strict_numerical_check=strict_numeric_primary,
                     )
                 except Exception as exc:  # noqa: BLE001
                     self._log(f"RAG 풀이 1차 실패: {exc} / 재시도 1회")
@@ -3130,8 +3352,10 @@ class EKHNPAutomator:
                         decision = solver.solve(
                             question=question,
                             options=options,
-                            top_k=retry_top_k + len(blocked_evidence_ids),
-                            exclude_evidence_ids=sorted(blocked_evidence_ids) if blocked_evidence_ids else None,
+                            top_k=retry_top_k + len(hard_excluded_evidence_ids),
+                            exclude_evidence_ids=sorted(hard_excluded_evidence_ids) if hard_excluded_evidence_ids else None,
+                            evidence_penalties=negative_evidence_penalties if negative_evidence_penalties else None,
+                            strict_numerical_check=strict_numeric_primary,
                         )
                     except Exception as retry_exc:  # noqa: BLE001
                         return _payload(False, f"RAG 풀이 호출 실패: {retry_exc}")
@@ -3156,8 +3380,10 @@ class EKHNPAutomator:
                     retry_decision = solver.solve(
                         question=question,
                         options=options,
-                        top_k=retry_top_k + len(blocked_evidence_ids),
-                        exclude_evidence_ids=sorted(blocked_evidence_ids) if blocked_evidence_ids else None,
+                        top_k=retry_top_k + len(hard_excluded_evidence_ids),
+                        exclude_evidence_ids=sorted(hard_excluded_evidence_ids) if hard_excluded_evidence_ids else None,
+                        evidence_penalties=negative_evidence_penalties if negative_evidence_penalties else None,
+                        strict_numerical_check=strict_numeric_primary,
                     )
                     retry_choice = int(getattr(retry_decision, "choice", 0))
                     retry_conf = float(getattr(retry_decision, "confidence", 0.0))
@@ -3174,6 +3400,49 @@ class EKHNPAutomator:
                         evidence_ids = retry_evidence_ids or evidence_ids
                 except Exception as exc:  # noqa: BLE001
                     self._log(f"RAG 재질문 실패: {exc}")
+
+                if confidence < confidence_threshold:
+                    model_chain = [str(x).strip() for x in getattr(solver, "generate_models", []) if str(x).strip()]
+                    model_chain = [m for i, m in enumerate(model_chain) if m not in model_chain[:i]]
+                    if len(model_chain) > 1 and not used_answer_bank:
+                        for alt_model in model_chain[1:]:
+                            strict_numeric_alt = numeric_question
+                            try:
+                                alt_decision = solver.solve(
+                                    question=question,
+                                    options=options,
+                                    top_k=retry_top_k + len(hard_excluded_evidence_ids),
+                                    exclude_evidence_ids=sorted(hard_excluded_evidence_ids) if hard_excluded_evidence_ids else None,
+                                    evidence_penalties=negative_evidence_penalties if negative_evidence_penalties else None,
+                                    preferred_models=[alt_model],
+                                    strict_numerical_check=strict_numeric_alt,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                self._log(f"교차검증 모델 실패: model={alt_model}, err={exc}")
+                                continue
+                            alt_choice = int(getattr(alt_decision, "choice", 0))
+                            alt_conf = float(getattr(alt_decision, "confidence", 0.0))
+                            alt_reason = str(getattr(alt_decision, "reason", ""))
+                            alt_eids = list(getattr(alt_decision, "evidence_ids", []))
+                            self._log(
+                                "교차검증 모델 결과: "
+                                f"Q {current}/{total} model={alt_model} -> choice={alt_choice}, conf={alt_conf:.2f}"
+                            )
+                            if alt_choice < 1 or alt_choice > len(options):
+                                continue
+                            improved = alt_conf >= (confidence + model_escalate_margin)
+                            if alt_conf >= confidence_threshold or improved:
+                                prev_conf = confidence
+                                choice = alt_choice
+                                confidence = alt_conf
+                                reason = f"[cross-check:{alt_model}] {alt_reason}".strip()
+                                evidence_ids = alt_eids or evidence_ids
+                                self._log(
+                                    "저신뢰 모델 스위칭 반영: "
+                                    f"Q {current}/{total} {prev_conf:.2f} -> {confidence:.2f}, model={alt_model}"
+                                )
+                                if confidence >= confidence_threshold:
+                                    break
 
                 if confidence < confidence_threshold:
                     dynamic_budget = fallback_low_conf_budget
@@ -3217,7 +3486,10 @@ class EKHNPAutomator:
                     "evidence_ids": list(evidence_ids or []),
                     "source": source,
                     "used_answer_bank": bool(used_answer_bank),
-                    "blocked_evidence_ids": sorted(blocked_evidence_ids),
+                    "blocked_evidence_ids": sorted(hard_excluded_evidence_ids),
+                    "evidence_penalties": {
+                        str(k): float(v) for k, v in negative_evidence_penalties.items() if str(k).strip()
+                    },
                 }
             )
             solved += 1
@@ -3293,6 +3565,7 @@ class EKHNPAutomator:
         solver = RagExamSolver(
             index_path=self.settings.rag_index_path,
             generate_model=self.settings.rag_generate_model,
+            generate_fallback_models=str(getattr(self.settings, "rag_generate_model_fallbacks", "")).split(","),
             embed_model=self.settings.rag_embed_model,
             ollama_base_url=self.settings.ollama_base_url,
             web_search_enabled=True,
@@ -3518,10 +3791,19 @@ class EKHNPAutomator:
                     pass
         return ""
 
-    def _extract_exam_question_snapshot(self, page: Page, force_ocr: bool = False) -> Optional[dict[str, Any]]:
+    def _extract_exam_question_snapshot(
+        self,
+        page: Page,
+        force_ocr: bool = False,
+        allow_ocr: bool = True,
+        prefer_structured: bool = False,
+    ) -> Optional[dict[str, Any]]:
         scopes: list[Any] = [page] + list(page.frames)
         best_snapshot: Optional[dict[str, Any]] = None
         best_score = -1
+        structured_options: list[str] = []
+        if prefer_structured:
+            structured_options = self._extract_exam_options_structured(page, attempts=2, wait_ms=320)
 
         for scope in scopes:
             body_text = ""
@@ -3534,15 +3816,25 @@ class EKHNPAutomator:
             picked = parsed_dom
             source = "dom"
 
-            needs_ocr = force_ocr or picked is None or int(picked.get("option_count", 0)) < 2
+            if picked is not None and len(structured_options) >= 2:
+                picked = dict(picked)
+                picked["options"] = list(structured_options[:5])
+                picked["option_count"] = len(picked["options"])
+                source = "structured+dom"
+
+            needs_ocr = force_ocr or (allow_ocr and (picked is None or int(picked.get("option_count", 0)) < 2))
             if needs_ocr:
                 ocr_text = self._ocr_text_from_scope(scope)
                 parsed_ocr = self._parse_exam_text_payload(ocr_text) if ocr_text else None
+                if parsed_ocr is not None and len(structured_options) >= 2:
+                    parsed_ocr = dict(parsed_ocr)
+                    parsed_ocr["options"] = list(structured_options[:5])
+                    parsed_ocr["option_count"] = len(parsed_ocr["options"])
                 if parsed_ocr is not None and (
                     picked is None or self._score_exam_snapshot(parsed_ocr) > self._score_exam_snapshot(picked)
                 ):
                     picked = parsed_ocr
-                    source = "ocr"
+                    source = "structured+ocr" if len(structured_options) >= 2 else "ocr"
 
             if picked is None:
                 continue
@@ -3569,89 +3861,95 @@ class EKHNPAutomator:
 
         return best_snapshot
 
-    def _extract_exam_options_structured(self, page: Page) -> list[str]:
+    def _extract_exam_options_structured(self, page: Page, attempts: int = 1, wait_ms: int = 0) -> list[str]:
         scopes: list[Any] = [page] + list(page.frames)
         best_texts: list[str] = []
         best_input_count = 0
 
-        for scope in scopes:
-            try:
-                info = scope.evaluate(
-                    """
-                    () => {
-                      const norm = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
-                      const isVisible = (el) => {
-                        if (!el) return false;
-                        const style = window.getComputedStyle(el);
-                        if (style && style.display === 'none') return false;
-                        const r = el.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0;
-                      };
-                      const cleanOpt = (txt) => {
-                        let s = norm(txt);
-                        s = s.replace(/^\\d+\\s*[\\.)]\\s*/, '');
-                        s = s.replace(/^([①②③④⑤]|[1-5]|[A-Ea-e]|[가-마])\\s*[\\.)]?\\s*/, '');
-                        return norm(s);
-                      };
+        max_attempts = max(1, int(attempts))
+        for attempt in range(max_attempts):
+            for scope in scopes:
+                try:
+                    info = scope.evaluate(
+                        """
+                        () => {
+                          const norm = (txt) => (txt || '').replace(/\\s+/g, ' ').trim();
+                          const isVisible = (el) => {
+                            if (!el) return false;
+                            const style = window.getComputedStyle(el);
+                            if (style && style.display === 'none') return false;
+                            const r = el.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0;
+                          };
+                          const cleanOpt = (txt) => {
+                            let s = norm(txt);
+                            s = s.replace(/^\\d+\\s*[\\.)]\\s*/, '');
+                            s = s.replace(/^([①②③④⑤]|[1-5]|[A-Ea-e]|[가-마])\\s*[\\.)]?\\s*/, '');
+                            return norm(s);
+                          };
 
-                      const radios = Array.from(
-                        document.querySelectorAll('input[name="choiceAnswers"], input[type="radio"], input[type="checkbox"]')
-                      ).filter(isVisible);
-                      const answerAnchors = Array.from(
-                        document.querySelectorAll(
-                          'a.answer-item, li[id^="example-item-"] a, li[class*="example-item"] a, .answer-box li a'
-                        )
-                      ).filter(isVisible);
+                          const radios = Array.from(
+                            document.querySelectorAll('input[name="choiceAnswers"], input[type="radio"], input[type="checkbox"]')
+                          ).filter(isVisible);
+                          const answerAnchors = Array.from(
+                            document.querySelectorAll(
+                              'a.answer-item, li[id^="example-item-"] a, li[class*="example-item"] a, .answer-box li a'
+                            )
+                          ).filter(isVisible);
 
-                      const seen = new Set();
-                      const texts = [];
-                      for (const input of radios) {
-                        let txt = '';
-                        const parentLabel = input.closest('label');
-                        if (parentLabel) txt = norm(parentLabel.innerText || parentLabel.textContent || '');
-                        if (!txt) {
-                          const container = input.closest('li, td, tr, div, p');
-                          if (container) txt = norm(container.innerText || container.textContent || '');
+                          const seen = new Set();
+                          const texts = [];
+                          for (const input of radios) {
+                            let txt = '';
+                            const parentLabel = input.closest('label');
+                            if (parentLabel) txt = norm(parentLabel.innerText || parentLabel.textContent || '');
+                            if (!txt) {
+                              const container = input.closest('li, td, tr, div, p');
+                              if (container) txt = norm(container.innerText || container.textContent || '');
+                            }
+                            txt = cleanOpt(txt);
+                            if (!txt || txt.length < 1) continue;
+                            if (seen.has(txt)) continue;
+                            seen.add(txt);
+                            texts.push(txt);
+                          }
+
+                          for (const anchor of answerAnchors) {
+                            let txt = cleanOpt(anchor.innerText || anchor.textContent || '');
+                            if (!txt) {
+                              const li = anchor.closest('li');
+                              if (li) txt = cleanOpt(li.innerText || li.textContent || '');
+                            }
+                            if (!txt || txt.length < 1) continue;
+                            if (seen.has(txt)) continue;
+                            seen.add(txt);
+                            texts.push(txt);
+                          }
+
+                          return {
+                            optionTexts: texts,
+                            inputCount: Math.max(radios.length, answerAnchors.length),
+                          };
                         }
-                        txt = cleanOpt(txt);
-                        if (!txt || txt.length < 1) continue;
-                        if (seen.has(txt)) continue;
-                        seen.add(txt);
-                        texts.push(txt);
-                      }
+                        """
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
 
-                      for (const anchor of answerAnchors) {
-                        let txt = cleanOpt(anchor.innerText || anchor.textContent || '');
-                        if (!txt) {
-                          const li = anchor.closest('li');
-                          if (li) txt = cleanOpt(li.innerText || li.textContent || '');
-                        }
-                        if (!txt || txt.length < 1) continue;
-                        if (seen.has(txt)) continue;
-                        seen.add(txt);
-                        texts.push(txt);
-                      }
+                if not isinstance(info, dict):
+                    continue
+                option_texts = [str(x).strip() for x in info.get("optionTexts", []) if str(x).strip()]
+                input_count = int(info.get("inputCount", 0) or 0)
 
-                      return {
-                        optionTexts: texts,
-                        inputCount: Math.max(radios.length, answerAnchors.length),
-                      };
-                    }
-                    """
-                )
-            except Exception:  # noqa: BLE001
-                continue
-
-            if not isinstance(info, dict):
-                continue
-            option_texts = [str(x).strip() for x in info.get("optionTexts", []) if str(x).strip()]
-            input_count = int(info.get("inputCount", 0) or 0)
-
-            if len(option_texts) > len(best_texts):
-                best_texts = option_texts
-                best_input_count = input_count
-            elif len(option_texts) == len(best_texts) and input_count > best_input_count:
-                best_input_count = input_count
+                if len(option_texts) > len(best_texts):
+                    best_texts = option_texts
+                    best_input_count = input_count
+                elif len(option_texts) == len(best_texts) and input_count > best_input_count:
+                    best_input_count = input_count
+            if len(best_texts) >= 2:
+                break
+            if attempt < max_attempts - 1 and wait_ms > 0:
+                page.wait_for_timeout(max(50, int(wait_ms)))
 
         if len(best_texts) >= 2:
             return best_texts[:5]
@@ -3699,6 +3997,20 @@ class EKHNPAutomator:
         src = cls._normalize_answer_text(text)
         if not src:
             return ""
+        # 시험 UI 동적/잡음 텍스트 제거(타이머, 네비게이션, 헤더)
+        src = re.sub(r"\b\d{1,2}\s*:\s*\d{2}\s*:\s*\d{2}\b", " ", src)
+        src = re.sub(r"\b답안\s*제출하기\b", " ", src)
+        src = re.sub(r"\b\d{1,3}\s*/\s*\d{1,3}\b", " ", src)
+        src = re.sub(r"\b(?:이전|다음)\b", " ", src)
+        src = re.sub(r"\[\s*종합평가\s*\]\s*-\s*", " ", src)
+        # 유형 마커가 있으면 그 지점부터 문항 본문으로 간주
+        marker_pos = -1
+        for marker in ("객관식", "진위형", "주관식"):
+            pos = src.find(marker)
+            if pos >= 0 and (marker_pos < 0 or pos < marker_pos):
+                marker_pos = pos
+        if marker_pos > 0:
+            src = src[marker_pos:]
         src = re.sub(r"^(?:문항|문제|q)\s*\d{1,3}\s*", " ", src)
         src = re.sub(r"^\d{1,3}\s*", " ", src)
         src = re.sub(r"^(?:객관식|주관식|단일형|복수형|보기)\s*", " ", src)
@@ -4679,7 +4991,12 @@ class EKHNPAutomator:
                       );
 
                       const nodes = Array.from(document.querySelectorAll('a,button,input,div,span,i,img,svg,use'));
-                      const keywords = ['다음', 'next', 'arrow', 'right', 'nextpage', 'btn_next', 'donext'];
+                      const keywords = [
+                        '다음', 'next', 'arrow', 'right', 'nextpage', 'btn_next', 'donext',
+                        '다음차시', '다음목차', 'continue',
+                        'chevron_right', 'keyboard_arrow_right', 'navigate_next',
+                        'angle-right', 'fa-angle-right'
+                      ];
                       let best = null;
                       const vw = Math.max(window.innerWidth || 0, document.documentElement.clientWidth || 0);
                       const vh = Math.max(window.innerHeight || 0, document.documentElement.clientHeight || 0);
@@ -4687,7 +5004,9 @@ class EKHNPAutomator:
                       for (const n of nodes) {
                         if (!isVisible(n)) continue;
                         const target = pickTarget(n);
-                        if (!isVisible(target)) continue;
+                        const targetVisible = isVisible(target);
+                        if (!targetVisible && !isInteractive(target) && !isInteractive(n)) continue;
+                        const clickEl = targetVisible ? target : n;
 
                         const attrs = [
                           n.textContent,
@@ -4712,19 +5031,43 @@ class EKHNPAutomator:
                         if (keywords.some((k) => attrs.includes(k))) score += 90;
                         if (
                           attrs.includes('>') || attrs.includes('›') || attrs.includes('＞')
-                          || attrs.includes('→') || attrs.includes('chevron-right') || attrs.includes('arrow-right')
+                          || attrs.includes('→') || attrs.includes('»')
+                          || attrs.includes('chevron-right') || attrs.includes('chevron_right')
+                          || attrs.includes('keyboard_arrow_right') || attrs.includes('navigate_next')
+                          || attrs.includes('arrow-right') || attrs.includes('angle-right')
                         ) {
                           score += 35;
+                        }
+                        if (
+                          attrs.includes('nextpage')
+                          || attrs.includes('arrow_right')
+                          || attrs.includes('sk_next')
+                          || attrs.includes('btn_next')
+                          || attrs.includes('next_btn')
+                        ) {
+                          score += 80;
+                        }
+                        if (attrs.includes('prev') || attrs.includes('arrow_left') || attrs.includes('sk_prev')) {
+                          score -= 70;
+                        }
+                        if (
+                          attrs.includes('previous')
+                          || attrs.includes('arrow-left')
+                          || attrs.includes('back')
+                          || attrs.includes('닫기')
+                          || attrs.includes('close')
+                        ) {
+                          score -= 90;
                         }
                         if (attrs.includes('donextshowitem') || attrs.includes('nextindex')) score += 35;
                         if ((n.tagName || '').toLowerCase() === 'img' || (n.tagName || '').toLowerCase() === 'svg') score += 8;
 
-                        const r = target.getBoundingClientRect();
+                        const r = clickEl.getBoundingClientRect();
                         if (vw > 0 && (r.left + r.width * 0.5) >= vw * 0.55) score += 8;
                         if (vh > 0 && (r.top + r.height * 0.5) >= vh * 0.35) score += 6;
 
-                        if (!isInteractive(target) && score < 100) continue;
-                        if (!best || score > best.score) best = { target, score };
+                        if (!isInteractive(target) && !isInteractive(clickEl) && score < 100) continue;
+                        if (!best || score > best.score) best = { target: clickEl, score };
                       }
 
                       if (!best || best.score < 35) return false;
@@ -5116,7 +5459,7 @@ class EKHNPAutomator:
         ticks = max(1, timeout_ms // 500)
         for _ in range(ticks):
             page.wait_for_timeout(500)
-            snap = self._extract_exam_question_snapshot(page)
+            snap = self._extract_exam_question_snapshot(page, allow_ocr=False, prefer_structured=True)
             if snap is None:
                 continue
             now_key = str(snap.get("key", ""))
@@ -6434,6 +6777,11 @@ class EKHNPAutomator:
                         self._dump_player_debug(candidate_page, "progress_lost_after_next")
                         return LoginResult(False, "다음 클릭 후 단계 정보를 읽지 못했습니다.", candidate_page.url)
                 if check[0] == current_step and check[1] == total_step:
+                    forced = self._force_next_step_transition(candidate_page)
+                    if forced:
+                        self._log("다음 클릭 무변화 감지: 강제 페이지 전환 함수를 호출했습니다.")
+                        if self._wait_progress_change(candidate_page, current_step, total_step):
+                            continue
                     self._log("단계 증가가 없어 추가 대기/복구 후 재시도를 진행합니다.")
                     advanced = False
                     for retry_idx in range(3):
@@ -6466,6 +6814,72 @@ class EKHNPAutomator:
                         )
 
         return LoginResult(False, "최대 클릭 횟수를 초과했습니다.", candidate_page.url)
+
+    def _force_next_step_transition(self, page: Page) -> bool:
+        if self._click_round_next_with_pageinfo(page, timeout_ms=1800):
+            return True
+
+        scopes: list[Any] = list(page.frames) + [page]
+        for scope in scopes:
+            try:
+                result = scope.evaluate(
+                    """
+                    () => {
+                      const clickAny = (el) => {
+                        if (!el) return false;
+                        try { el.click(); return true; } catch (e) {}
+                        try {
+                          el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                          return true;
+                        } catch (e) {}
+                        return false;
+                      };
+
+                      const direct = document.querySelector(
+                        '#nextPage, a#nextPage, #nextBtn a.next, a[onclick*="doNext"], a[onclick*="nextPage"], button.nextPage'
+                      );
+                      if (clickAny(direct)) return { ok: true, mode: 'direct-click' };
+
+                      if (typeof nextPage === 'function') {
+                        nextPage();
+                        return { ok: true, mode: 'fn-nextPage' };
+                      }
+                      if (typeof doNext === 'function') {
+                        doNext();
+                        return { ok: true, mode: 'fn-doNext' };
+                      }
+                      if (window.SUB && typeof window.SUB.doPage === 'function') {
+                        window.SUB.doPage(1);
+                        return { ok: true, mode: 'fn-SUB.doPage' };
+                      }
+                      if (window.parent && window.parent.SUB && typeof window.parent.SUB.doPage === 'function') {
+                        window.parent.SUB.doPage(1);
+                        return { ok: true, mode: 'fn-parent.SUB.doPage' };
+                      }
+                      if (window.parent && window.parent.RES && typeof window.parent.RES.doPage === 'function') {
+                        window.parent.RES.doPage(1);
+                        return { ok: true, mode: 'fn-parent.RES.doPage' };
+                      }
+                      if (window.top && window.top.RES && typeof window.top.RES.doPage === 'function') {
+                        window.top.RES.doPage(1);
+                        return { ok: true, mode: 'fn-top.RES.doPage' };
+                      }
+                      if (window.parent && typeof window.parent.doPage === 'function') {
+                        window.parent.doPage(1);
+                        return { ok: true, mode: 'fn-parent.doPage' };
+                      }
+                      return { ok: false, mode: 'none' };
+                    }
+                    """
+                )
+                if isinstance(result, dict) and result.get("ok"):
+                    mode = str(result.get("mode", "unknown"))
+                    self._log(f"강제 페이지 전환 호출 성공: {mode}")
+                    page.wait_for_timeout(700)
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
 
     def _extract_step_progress(self, page: Page) -> Optional[tuple[int, int]]:
         scopes: list[Any] = [page] + list(page.frames)
@@ -6513,22 +6927,178 @@ class EKHNPAutomator:
                 continue
         return candidates
 
+    @staticmethod
+    def _parse_page_info_counter(text: str) -> Optional[tuple[int, int]]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        match = re.search(r"(\d{1,3})\s*/\s*(\d{1,3})", raw)
+        if not match:
+            return None
+        try:
+            cur = int(match.group(1))
+            total = int(match.group(2))
+        except Exception:  # noqa: BLE001
+            return None
+        if total < 1 or cur < 1 or cur > total:
+            return None
+        return cur, total
+
+    def _click_round_next_with_pageinfo(self, page: Page, timeout_ms: int = 3500) -> bool:
+        # 우하단 동그라미 화살표(#nextPage)를 우선 클릭하고, pageInfoDiv의 현재 페이지 증가를 확인합니다.
+        scopes: list[Any] = [page] + list(page.frames)
+        for scope in scopes:
+            try:
+                next_btn = scope.locator("#nextPage").first
+                page_info = scope.locator("#pageInfoDiv").first
+                if next_btn.count() <= 0 or page_info.count() <= 0:
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+
+            try:
+                before_text = page_info.inner_text(timeout=1200).strip()
+            except Exception:  # noqa: BLE001
+                before_text = ""
+            before_counter = self._parse_page_info_counter(before_text)
+
+            try:
+                next_btn.click(timeout=2500, no_wait_after=True)
+            except Exception:  # noqa: BLE001
+                try:
+                    next_btn.click(timeout=1500, force=True, no_wait_after=True)
+                except Exception:  # noqa: BLE001
+                    continue
+
+            ticks = max(1, timeout_ms // 250)
+            for _ in range(ticks):
+                page.wait_for_timeout(250)
+                try:
+                    after_text = page_info.inner_text(timeout=1000).strip()
+                except Exception:  # noqa: BLE001
+                    continue
+                after_counter = self._parse_page_info_counter(after_text)
+
+                # 고정 1/2->2/2가 아니라 "현재 페이지 수가 올라갔는지"를 기준으로 성공 판정합니다.
+                if (
+                    before_counter is not None
+                    and after_counter is not None
+                    and after_counter[1] == before_counter[1]
+                    and after_counter[0] > before_counter[0]
+                ):
+                    self._log(f"동그라미 nextPage 클릭 성공: pageInfoDiv {before_text} -> {after_text}")
+                    return True
+
+                # 카운터 파싱이 흔들려도 텍스트가 바뀌면 이동된 것으로 간주합니다.
+                if after_text and before_text and after_text != before_text:
+                    self._log(f"동그라미 nextPage 클릭 성공: pageInfoDiv {before_text} -> {after_text}")
+                    return True
+        return False
+
     def _click_next_button(self, page: Page) -> bool:
         scopes: list[Any] = [page] + list(page.frames)
 
+        if self._click_round_next_with_pageinfo(page):
+            page.wait_for_timeout(500)
+            return True
+
         # 1) 콘텐츠 프레임(01.html 등) 내부 nextPage를 최우선 시도
         for scope in page.frames:
+            # 사이트가 JS programmatic click을 무시하는 케이스가 있어
+            # 우선 Playwright의 실제 사용자 클릭(신뢰 이벤트) 경로를 먼저 시도합니다.
+            trusted_selectors = [
+                "a#nextPage",
+                "#nextPage",
+                "#nextPage i",
+                "#nextPage img",
+                ".lwd_bar .page a#nextPage",
+                ".lwd_bar .page a:has(i.arrow_right)",
+                ".lwd_bar .page a:has(i.sk_next)",
+                ".lwd_bar .page a:has-text('>')",
+                ".lwd_bar .page a:has-text('›')",
+                ".lwd_bar .page a:has-text('»')",
+            ]
+            if self._click_first_visible(scope, trusted_selectors, max_items=8):
+                self._log("콘텐츠 프레임 nextPage(화살표/이미지) 실제 클릭 성공")
+                page.wait_for_timeout(700)
+                return True
+
             try:
                 clicked = scope.evaluate(
                     """
                     () => {
+                        const isShown = (el) => {
+                          if (!el || !el.getBoundingClientRect) return false;
+                          const style = window.getComputedStyle(el);
+                          if (!style) return false;
+                          if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                            return false;
+                          }
+                          const r = el.getBoundingClientRect();
+                          return r.width > 0 && r.height > 0;
+                        };
+                        const isClickable = (el) => {
+                          if (!el) return false;
+                          const style = window.getComputedStyle(el);
+                          if (!style) return false;
+                          if (style.pointerEvents === 'none') return false;
+                          if (el.hasAttribute('disabled')) return false;
+                          if (String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return false;
+                          return true;
+                        };
+                        const clickAny = (el) => {
+                          if (!el) return false;
+                          if (!isClickable(el)) return false;
+                          try { el.click(); return true; } catch (e) {}
+                          try {
+                            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                            return true;
+                          } catch (e) {}
+                          return false;
+                        };
+                        const clickInteractive = (el) => {
+                          if (!el) return false;
+                          const target = el.closest(
+                            'a,button,input[type="button"],input[type="submit"],[role="button"],[onclick],#nextPage,.nextPage'
+                          ) || el;
+                          if (clickAny(target)) return true;
+                          // 아이콘/이미지일 때도 상위 인터랙티브 컨트롤만 클릭 대상으로 취급합니다.
+                          const parentTarget = target.closest(
+                            'a,button,input[type="button"],input[type="submit"],[role="button"],[onclick]'
+                          );
+                          if (clickAny(parentTarget)) return true;
+                          return false;
+                        };
+                        const direct = document.querySelector(
+                          'a#nextPage, #nextPage, a.nextPage, [id*="nextpage" i], [class*="nextpage" i]'
+                        );
+                        if (direct) {
+                          if (isShown(direct) && clickInteractive(direct)) return true;
+                          const nestedIcon = direct.querySelector('i,svg,img,span');
+                          if (isShown(nestedIcon) && clickInteractive(nestedIcon)) return true;
+                        }
+                        const icon = document.querySelector(
+                          '#nextPage i, i.arrow_right, i.sk_next, .icc.arrow_right, ' +
+                          '#nextPage img, img[src*="arrow_right" i], img[src*="btn_next" i], img[alt*="next" i]'
+                        );
+                        if (icon && isShown(icon)) {
+                          if (clickInteractive(icon)) return true;
+                        }
                         const btn = document.querySelector('button.nextPage.movePage, button.nextPage');
                         if (btn) {
-                          btn.click();
-                          return true;
+                          if (clickInteractive(btn)) return true;
                         }
                         if (typeof nextPage === 'function') {
                           nextPage();
+                          return true;
+                        }
+                        if (typeof doNext === 'function') {
+                          doNext();
+                          return true;
+                        }
+                        // e-khnp popup controller fallback: 실제 페이지 전환 함수 호출
+                        if (window.parent && window.parent.RES && typeof window.parent.RES.doPage === 'function') {
+                          window.parent.RES.doPage(1);
                           return true;
                         }
                         return false;
@@ -6536,6 +7106,7 @@ class EKHNPAutomator:
                     """
                 )
                 if clicked:
+                    self._log("콘텐츠 프레임 nextPage(화살표/이미지) 클릭 성공")
                     page.wait_for_timeout(700)
                     return True
             except Exception:  # noqa: BLE001
@@ -6543,20 +7114,55 @@ class EKHNPAutomator:
 
         # 2) 팝업 본문 네비게이션(다음/Next)
         selectors = [
+            'a#nextPage',
+            '#nextPage',
+            '#nextPage img',
+            '#nextPage i',
+            '.lwd_bar .page a#nextPage',
+            '.lwd_bar .page a:has(i.arrow_right)',
+            '.lwd_bar .page a:has(i.sk_next)',
+            '.lwd_bar .page a:has(img[src*="next" i])',
+            '.lwd_bar .page a:has(img[src*="arrow_right" i])',
             '#nextBtn a.next',
             'a[onclick*="doNext"]',
+            'a[onclick*="nextPage"]',
             "button.nextPage",
+            "a.nextPage",
             "a.next",
             "button.next",
+            'img[alt*="next" i]',
+            'img[alt*="다음" i]',
+            'img[src*="btn_next" i]',
+            'img[src*="arrow_right" i]',
+            '[class*="arrow_right" i]',
+            '[class*="arrow-right" i]',
+            '[class*="chevron_right" i]',
+            '[class*="chevron-right" i]',
+            '[class*="next" i][role="button"]',
+            '[title*="next" i]',
+            '[title*="다음" i]',
+            'a:has-text("다음 차시")',
+            'button:has-text("다음 차시")',
+            'a:has-text("다음목차")',
+            'button:has-text("다음목차")',
+            'a:has-text("다음 문항")',
+            'button:has-text("다음 문항")',
+            'a:has-text("계속")',
+            'button:has-text("계속")',
             'button:has-text("다음")',
             'a:has-text("다음")',
             'button:has-text(">")',
             'a:has-text(">")',
             'button:has-text("›")',
             'a:has-text("›")',
+            'button:has-text("»")',
+            'a:has-text("»")',
+            'button:has-text("→")',
+            'a:has-text("→")',
             '[role="button"]:has-text("다음")',
             '[aria-label*="다음"]',
             '[aria-label*="next"]',
+            '[aria-label*="continue" i]',
             'span:has-text("다음")',
             'div:has-text("다음")',
         ]
