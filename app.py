@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import threading
 import time
+import traceback
 from typing import Any, Callable
 import uuid
 
@@ -39,6 +40,7 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)(access_code|접속코드)\s*[:=]\s*([^\s,;]+)"),
 ]
 SESSION_LOG_MAX_LINES = 1500
+ISO_Z_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 
 
 def _utc_now_iso() -> str:
@@ -53,16 +55,127 @@ def _restrict_file_permissions(path: Path) -> None:
 
 
 def append_log(message: str) -> None:
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = _utc_now_iso()
     line = f"[{timestamp}] {message}"
     logs = st.session_state.setdefault("logs", [])
     logs.append(line)
     if len(logs) > SESSION_LOG_MAX_LINES:
         st.session_state.logs = logs[-SESSION_LOG_MAX_LINES:]
-    logfile = LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.log"
+    logfile = LOG_DIR / f"{datetime.now(UTC).strftime('%Y-%m-%d')}.log"
     with logfile.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
     _restrict_file_permissions(logfile)
+
+
+def _is_client_local_time_enabled(settings: Settings) -> bool:
+    return str(getattr(settings, "app_time_display_mode", "") or "").strip().lower() == "client-local"
+
+
+def _render_client_localized_html(
+    inner_html: str,
+    *,
+    height_px: int,
+    scrolling: bool = False,
+) -> None:
+    if os.getenv("APP_TIME_DISPLAY_MODE", "client-local").strip().lower() != "client-local":
+        st.markdown(inner_html, unsafe_allow_html=True)
+        return
+    block_id = f"localized-{uuid.uuid4().hex}"
+    payload = f"""
+<div id="{block_id}">{inner_html}</div>
+<script>
+(() => {{
+  const root = document.getElementById({json.dumps(block_id)});
+  if (!root) return;
+  const pad = (n) => String(n).padStart(2, '0');
+  const formatLocal = (iso) => {{
+    try {{
+      const d = new Date(String(iso || ''));
+      if (Number.isNaN(d.getTime())) return String(iso || '');
+      return `${{d.getFullYear()}}-${{pad(d.getMonth() + 1)}}-${{pad(d.getDate())}} ${{
+        pad(d.getHours())
+      }}:${{pad(d.getMinutes())}}:${{pad(d.getSeconds())}}`;
+    }} catch (e) {{
+      return String(iso || '');
+    }}
+  }};
+  root.querySelectorAll('[data-utc]').forEach((node) => {{
+    const iso = node.getAttribute('data-utc') || '';
+    const value = formatLocal(iso);
+    node.textContent = value;
+    node.setAttribute('title', `${{value}} (${{
+      Intl.DateTimeFormat().resolvedOptions().timeZone || 'local'
+    }})`);
+  }});
+}})();
+</script>
+"""
+    components.html(payload, height=max(36, int(height_px)), scrolling=scrolling)
+
+
+def _split_log_line_timestamp(line: str) -> tuple[str, str]:
+    raw = str(line or "")
+    match = re.match(r"^\[([^\]]+)\]\s*(.*)$", raw)
+    if not match:
+        return "", raw
+    return str(match.group(1)).strip(), str(match.group(2)).strip()
+
+
+def _render_timestamp_span(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "-"
+    escaped = html.escape(raw)
+    if ISO_Z_RE.match(raw):
+        return f"<span data-utc=\"{escaped}\">{escaped}</span>"
+    return escaped
+
+
+def _render_simple_html_table(
+    rows: list[dict[str, Any]],
+    *,
+    columns: list[tuple[str, str]],
+    height_px: int = 260,
+    empty_text: str = "(데이터 없음)",
+) -> None:
+    if not rows:
+        _render_client_localized_html(
+            (
+                "<div style='padding:10px; border:1px solid #d9d9d9; border-radius:6px; "
+                "background:#fafafa; color:#666;'>"
+                f"{html.escape(empty_text)}"
+                "</div>"
+            ),
+            height_px=58,
+            scrolling=False,
+        )
+        return
+
+    header_html = "".join(
+        f"<th style='text-align:left; padding:8px 10px; border-bottom:1px solid #d9d9d9;'>{html.escape(label)}</th>"
+        for key, label in columns
+    )
+    body_rows: list[str] = []
+    for row in rows:
+        cell_html = []
+        for key, _label in columns:
+            value = row.get(key, "")
+            text = _render_timestamp_span(str(value)) if isinstance(value, str) else html.escape(str(value))
+            cell_html.append(
+                "<td style='padding:8px 10px; border-bottom:1px solid #efefef; vertical-align:top;'>"
+                f"{text}"
+                "</td>"
+            )
+        body_rows.append("<tr>" + "".join(cell_html) + "</tr>")
+
+    table_html = (
+        "<div style='border:1px solid #d9d9d9; border-radius:6px; overflow:auto; background:#fff;'>"
+        "<table style='width:100%; border-collapse:collapse; font-size:12px; line-height:1.45;'>"
+        f"<thead><tr style='background:#fafafa;'>{header_html}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table></div>"
+    )
+    _render_client_localized_html(table_html, height_px=height_px, scrolling=True)
 
 
 def _is_access_code_enabled(settings: Settings) -> bool:
@@ -316,52 +429,94 @@ def _build_task_settings(
     return settings
 
 
-def _result_payload(result: Any) -> dict[str, Any]:
-    return {
+def _result_payload(result: Any, *, diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = {
         "success": bool(getattr(result, "success", False)),
         "message": str(getattr(result, "message", "")),
         "current_url": str(getattr(result, "current_url", "")),
     }
+    if diagnostics:
+        payload["diagnostics"] = diagnostics
+        if not payload["current_url"]:
+            payload["current_url"] = str(diagnostics.get("current_url", "") or "")
+    return payload
 
 
 def _run_automator_method(
     task_settings: Settings,
     method_name: str,
     log_fn: Callable[[str], None],
+    stop_requested: Callable[[], bool],
     **kwargs: Any,
 ) -> dict[str, Any]:
     safe_log = _safe_log_fn(task_settings, log_fn)
-    automator = EKHNPAutomator(task_settings, log_fn=safe_log)
+    automator = EKHNPAutomator(task_settings, log_fn=safe_log, stop_requested=stop_requested)
     method = getattr(automator, method_name)
-    result = method(**kwargs)
-    payload = _result_payload(result)
+    try:
+        result = method(**kwargs)
+        payload = _result_payload(result, diagnostics=automator.get_runtime_diagnostics())
+    except EKHNPAutomator.StopRequested as exc:
+        payload = {
+            "success": False,
+            "canceled": True,
+            "message": str(exc),
+            "current_url": "",
+            "diagnostics": automator.get_runtime_diagnostics(),
+        }
+        safe_log(str(exc))
+    except Exception as exc:  # noqa: BLE001
+        payload = {
+            "success": False,
+            "message": f"오류 발생: {exc}",
+            "current_url": "",
+            "traceback": traceback.format_exc(),
+            "diagnostics": automator.get_runtime_diagnostics(),
+        }
+        safe_log(f"오류 발생: {exc}")
     safe_log(f"결과: {payload['message']} / url={payload['current_url']}")
     return payload
 
 
-def _run_rag_index(task_settings: Settings, log_fn: Callable[[str], None]) -> dict[str, Any]:
+def _run_rag_index(
+    task_settings: Settings,
+    log_fn: Callable[[str], None],
+    stop_requested: Callable[[], bool],
+) -> dict[str, Any]:
     safe_log = _safe_log_fn(task_settings, log_fn)
     from rag_index import build_rag_index
 
-    result = build_rag_index(
-        docs_dir=task_settings.rag_docs_dir,
-        index_path=task_settings.rag_index_path,
-        embed_model=task_settings.rag_embed_model,
-        chunk_size=task_settings.rag_chunk_size,
-        overlap=task_settings.rag_chunk_overlap,
-        min_chunk_chars=task_settings.rag_min_chunk_chars,
-        max_chunks=task_settings.rag_max_chunks,
-        max_total_size_gb=task_settings.rag_storage_limit_gb,
-        prune_old_indexes=task_settings.rag_prune_old_indexes,
-        ollama_base_url=task_settings.ollama_base_url,
-        log_fn=safe_log,
-    )
-    message = (
-        "RAG 인덱스 완료: "
-        f"files={result.get('files')} chunks={result.get('chunks')} path={result.get('index_path')}"
-    )
-    safe_log(f"결과: {message}")
-    return {"success": True, "message": message, "index_result": result}
+    if stop_requested():
+        message = "사용자 중단 요청으로 작업을 중지합니다."
+        safe_log(message)
+        return {"success": False, "canceled": True, "message": message}
+
+    try:
+        result = build_rag_index(
+            docs_dir=task_settings.rag_docs_dir,
+            index_path=task_settings.rag_index_path,
+            embed_model=task_settings.rag_embed_model,
+            chunk_size=task_settings.rag_chunk_size,
+            overlap=task_settings.rag_chunk_overlap,
+            min_chunk_chars=task_settings.rag_min_chunk_chars,
+            max_chunks=task_settings.rag_max_chunks,
+            max_total_size_gb=task_settings.rag_storage_limit_gb,
+            prune_old_indexes=task_settings.rag_prune_old_indexes,
+            ollama_base_url=task_settings.ollama_base_url,
+            log_fn=safe_log,
+        )
+        message = (
+            "RAG 인덱스 완료: "
+            f"files={result.get('files')} chunks={result.get('chunks')} path={result.get('index_path')}"
+        )
+        safe_log(f"결과: {message}")
+        return {"success": True, "message": message, "index_result": result}
+    except Exception as exc:  # noqa: BLE001
+        safe_log(f"RAG 인덱스 오류: {exc}")
+        return {
+            "success": False,
+            "message": f"RAG 인덱스 오류: {exc}",
+            "traceback": traceback.format_exc(),
+        }
 
 
 def _run_one_click(
@@ -370,16 +525,23 @@ def _run_one_click(
     max_timefill_checks: int,
     force_reindex: bool,
     log_fn: Callable[[str], None],
+    stop_requested: Callable[[], bool],
 ) -> dict[str, Any]:
     safe_log = _safe_log_fn(task_settings, log_fn)
     index_path = Path(task_settings.rag_index_path) if task_settings.rag_index_path else None
+    if stop_requested():
+        message = "사용자 중단 요청으로 작업을 중지합니다."
+        safe_log(message)
+        return {"success": False, "canceled": True, "message": message}
     need_reindex = bool(force_reindex)
     if index_path is not None and not index_path.exists():
         need_reindex = True
         safe_log(f"RAG 인덱스 파일이 없어 자동 생성합니다: {index_path}")
 
     if need_reindex:
-        _run_rag_index(task_settings, safe_log)
+        reindex_result = _run_rag_index(task_settings, safe_log, stop_requested)
+        if bool(reindex_result.get("canceled", False)):
+            return reindex_result
 
     max_resume_retry = max(0, min(4, int(getattr(task_settings, "app_resume_retry_max", 2) or 2)))
     backoff_sec = max(0.0, min(20.0, float(getattr(task_settings, "app_resume_retry_backoff_sec", 2) or 2)))
@@ -400,11 +562,18 @@ def _run_one_click(
         task_settings,
         "login_and_run_completion_workflow",
         safe_log,
+        stop_requested,
         check_interval_minutes=check_interval_minutes,
         max_timefill_checks=max_timefill_checks,
     )
     for retry_idx in range(1, max_resume_retry + 1):
         if bool(latest.get("success", False)):
+            return latest
+        if bool(latest.get("canceled", False)) or stop_requested():
+            if not latest.get("message"):
+                latest["message"] = "사용자 중단 요청으로 작업을 중지합니다."
+            latest["success"] = False
+            latest["canceled"] = True
             return latest
         message = str(latest.get("message", "")).lower()
         should_retry = any(token in message for token in transient_tokens)
@@ -420,6 +589,7 @@ def _run_one_click(
             task_settings,
             "login_and_run_completion_workflow",
             safe_log,
+            stop_requested,
             check_interval_minutes=check_interval_minutes,
             max_timefill_checks=max_timefill_checks,
         )
@@ -435,7 +605,7 @@ def _enqueue_job(
     settings: Settings,
     queue_manager: TaskQueueManager,
     name: str,
-    runner: Callable[[Callable[[str], None]], dict[str, Any]],
+    runner: Callable[[Callable[[str], None], Callable[[], bool]], dict[str, Any]],
     owner: str,
     owner_label: str,
     role: str,
@@ -480,22 +650,116 @@ def _enqueue_job(
     return job_id
 
 
-def _render_scrollable_log_block(lines: list[str], *, height_px: int = 240, empty_text: str = "(로그 없음)") -> None:
-    if lines:
-        rendered = "<br/>".join(html.escape(str(line)) for line in lines)
-    else:
-        rendered = html.escape(empty_text)
-    st.markdown(
-        (
-            f"<div style='max-height:{height_px}px; overflow-y:auto; padding:10px; "
-            "border:1px solid #d9d9d9; border-radius:6px; background:#111111; color:#f3f3f3; "
-            "font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; "
-            "font-size:12px; line-height:1.45;'>"
-            f"{rendered}"
-            "</div>"
-        ),
-        unsafe_allow_html=True,
-    )
+def _render_scrollable_log_block(
+    lines: list[str],
+    *,
+    height_px: int = 240,
+    empty_text: str = "(로그 없음)",
+    newest_first: bool = True,
+    state_key: str = "default",
+) -> None:
+    rendered_lines: list[str] = []
+    source_lines = list(reversed(lines)) if newest_first else list(lines)
+    for line in source_lines:
+        ts, rest = _split_log_line_timestamp(str(line))
+        if ts:
+            rendered_lines.append(
+                "<div style='white-space:pre-wrap; word-break:break-word;'>"
+                f"[{_render_timestamp_span(ts)}] {html.escape(rest)}"
+                "</div>"
+            )
+        else:
+            rendered_lines.append(
+                "<div style='white-space:pre-wrap; word-break:break-word;'>"
+                f"{html.escape(str(line))}"
+                "</div>"
+            )
+    if not rendered_lines:
+        rendered_lines.append(html.escape(empty_text))
+    safe_state_key = re.sub(r"[^0-9A-Za-z_-]+", "-", str(state_key or "default")).strip("-") or "default"
+    block_id = f"log-block-{safe_state_key}"
+    content_sig = hashlib.sha1(
+        "\n".join(str(line) for line in source_lines).encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:20]
+    payload = f"""
+<div
+  id="{block_id}"
+  data-content-sig="{content_sig}"
+  style="max-height:{int(height_px)}px; overflow-y:auto; padding:10px; border:1px solid #d9d9d9;
+         border-radius:6px; background:#111111; color:#f3f3f3;
+         font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+         font-size:12px; line-height:1.45;"
+>
+  {''.join(rendered_lines)}
+</div>
+<script>
+(() => {{
+  const root = document.getElementById({json.dumps(block_id)});
+  if (!root) return;
+  const storageKey = {json.dumps(f"log-scroll:{safe_state_key}")};
+  const sig = root.getAttribute("data-content-sig") || "";
+  const pad = (n) => String(n).padStart(2, "0");
+  const formatLocal = (iso) => {{
+    try {{
+      const d = new Date(String(iso || ""));
+      if (Number.isNaN(d.getTime())) return String(iso || "");
+      return `${{d.getFullYear()}}-${{pad(d.getMonth() + 1)}}-${{pad(d.getDate())}} ${{
+        pad(d.getHours())
+      }}:${{pad(d.getMinutes())}}:${{pad(d.getSeconds())}}`;
+    }} catch (_err) {{
+      return String(iso || "");
+    }}
+  }};
+  root.querySelectorAll("[data-utc]").forEach((node) => {{
+    const iso = node.getAttribute("data-utc") || "";
+    const value = formatLocal(iso);
+    node.textContent = value;
+    node.setAttribute("title", `${{value}} (${{
+      Intl.DateTimeFormat().resolvedOptions().timeZone || "local"
+    }})`);
+  }});
+  const getStore = () => {{
+    try {{
+      if (window.top && window.top.sessionStorage) return window.top.sessionStorage;
+    }} catch (_err) {{}}
+    try {{
+      return window.sessionStorage;
+    }} catch (_err) {{
+      return null;
+    }}
+  }};
+  const store = getStore();
+  const loadState = () => {{
+    if (!store) return {{}};
+    try {{
+      return JSON.parse(store.getItem(storageKey) || "{{}}");
+    }} catch (_err) {{
+      return {{}};
+    }}
+  }};
+  const saveState = () => {{
+    if (!store) return;
+    try {{
+      store.setItem(storageKey, JSON.stringify({{ sig, scrollTop: root.scrollTop }}));
+    }} catch (_err) {{}}
+  }};
+  const state = loadState();
+  if (String(state.sig || "") !== sig) {{
+    root.scrollTop = 0;
+  }} else if (typeof state.scrollTop === "number" && Number.isFinite(state.scrollTop)) {{
+    root.scrollTop = state.scrollTop;
+  }}
+  let timer = null;
+  root.addEventListener("scroll", () => {{
+    if (timer) window.clearTimeout(timer);
+    timer = window.setTimeout(saveState, 80);
+  }}, {{ passive: true }});
+  window.setTimeout(saveState, 0);
+}})();
+</script>
+"""
+    components.html(payload, height=height_px + 28, scrolling=False)
 
 
 def _render_queue_status(
@@ -506,6 +770,7 @@ def _render_queue_status(
 ) -> bool:
     st.subheader("작업 큐 상태")
     owner_filter = owner
+    runtime_info = queue_manager.runtime_info()
 
     if is_admin and owner is None:
         owner_rows = queue_manager.owner_stats()
@@ -533,7 +798,20 @@ def _render_queue_status(
                 for row in owner_rows
             ]
             st.caption("계정별 큐 현황")
-            st.dataframe(table_rows, width='stretch', hide_index=True)
+            _render_simple_html_table(
+                table_rows,
+                columns=[
+                    ("owner_label", "계정"),
+                    ("pending", "Pending"),
+                    ("running", "Running"),
+                    ("failed", "Failed"),
+                    ("succeeded", "Succeeded"),
+                    ("total", "Total"),
+                    ("latest_created_at", "최근 생성"),
+                ],
+                height_px=220,
+                empty_text="계정별 큐 현황이 없습니다.",
+            )
 
             owner_options = ["__all__"] + [str(row.get("owner", "")) for row in owner_rows]
             owner_labels = {
@@ -560,6 +838,11 @@ def _render_queue_status(
     s3.metric("Succeeded", stats["succeeded"])
     s4.metric("Failed", stats["failed"])
     s5.metric("Total", stats["total"])
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("설정 워커", runtime_info["configured_workers"])
+    r2.metric("활성 워커", runtime_info["active_workers"])
+    r3.metric("실행 슬롯 사용", runtime_info["running_jobs"])
+    r4.metric("대기 작업", runtime_info["pending_jobs"])
     left, right = st.columns([3, 1])
     with left:
         st.caption("실행은 워커에서 순차 처리됩니다. 브라우저 탭을 닫아도 서버에서 계속 진행됩니다.")
@@ -600,25 +883,94 @@ def _render_queue_status(
             st.session_state.selected_job_id = retry_job_id
             st.success(f"재시도 작업을 등록했습니다. id={retry_job_id}")
 
+    def _render_stop_button(job: dict[str, Any], button_key: str) -> None:
+        if str(job.get("status")) not in {"pending", "running"}:
+            return
+        if st.button("STOP", key=button_key, width='content'):
+            owner_key = str(job.get("owner") or "").strip() or None
+            canceled = queue_manager.cancel_job(str(job.get("job_id", "")), owner=owner_key)
+            if canceled:
+                st.session_state.selected_job_id = str(job.get("job_id", st.session_state.get("selected_job_id", "")))
+                st.warning("중단 요청을 전송했습니다. 현재 단계 종료 후 작업이 멈춥니다.")
+            else:
+                st.info("이미 종료되었거나 중단할 수 없는 작업입니다.")
+
     def _render_job_logs(job: dict[str, Any], *, key_suffix: str, height_px: int) -> None:
         logs = list(job.get("logs") or [])
-        lines_for_view = logs[-8:]
-        _render_scrollable_log_block(lines_for_view, height_px=height_px, empty_text="(작업 로그 없음)")
+        _render_scrollable_log_block(
+            logs,
+            height_px=height_px,
+            empty_text="(작업 로그 없음)",
+            state_key=f"job-{key_suffix}",
+        )
+
+    def _render_job_diagnostics(job: dict[str, Any], *, key_suffix: str) -> None:
+        diagnostic_path = str(job.get("diagnostic_path", "") or "").strip()
+        result_payload = job.get("result") if isinstance(job.get("result"), dict) else {}
+        diagnostics = result_payload.get("diagnostics") if isinstance(result_payload.get("diagnostics"), dict) else {}
+        if diagnostic_path:
+            st.caption(f"진단 번들: {diagnostic_path}")
+        if not diagnostics:
+            return
+        artifact_rows = [row for row in diagnostics.get("artifact_paths", []) if isinstance(row, dict)]
+        run_id = str(diagnostics.get("run_id", "") or "").strip()
+        last_course_title = str(diagnostics.get("last_course_title", "") or "").strip()
+        last_lesson_title = str(diagnostics.get("last_lesson_title", "") or "").strip()
+        current_percent = diagnostics.get("last_course_progress_percent")
+        exam_summary = diagnostics.get("last_exam_summary") if isinstance(diagnostics.get("last_exam_summary"), dict) else {}
+        if not any([run_id, last_course_title, last_lesson_title, artifact_rows, exam_summary]):
+            return
+        with st.expander("진단 정보", expanded=False):
+            if run_id:
+                st.caption(f"자동화 run_id: {run_id}")
+            if last_course_title:
+                st.write(f"마지막 과정: {last_course_title}")
+            if last_lesson_title:
+                st.write(f"마지막 차시: {last_lesson_title}")
+            if isinstance(current_percent, int) and current_percent >= 0:
+                st.write(f"마지막 강의 진도율: {current_percent}%")
+            if exam_summary:
+                st.write(
+                    "마지막 시험 요약: "
+                    f"success={bool(exam_summary.get('success', False))}, "
+                    f"solved={int(exam_summary.get('solved', 0) or 0)}, "
+                    f"skipped={int(exam_summary.get('skipped', 0) or 0)}, "
+                    f"low_conf={int(exam_summary.get('low_conf_used', 0) or 0)}"
+                )
+            if artifact_rows:
+                lines = []
+                for row in artifact_rows[:20]:
+                    kind = str(row.get("kind", "") or "artifact")
+                    label = str(row.get("label", "") or "").strip()
+                    path = str(row.get("path", "") or "").strip()
+                    prefix = f"{kind}"
+                    if label:
+                        prefix = f"{prefix} ({label})"
+                    lines.append(f"{prefix}: {path}")
+                st.code("\n".join(lines))
 
     if compact:
         current_job = next((job for job in jobs if job.get("status") in {"pending", "running"}), jobs[0])
         current_job_detail = queue_manager.get_job(str(current_job.get("job_id", "")), owner=owner_filter, include_logs=True)
         if current_job_detail:
             current_job = current_job_detail
-        st.caption(
-            f"현재 작업: {current_job.get('name', '-')}"
-            f" / 상태: {current_job.get('status', '-')}"
-            f" / 생성: {current_job.get('created_at', '-')}"
+        _render_client_localized_html(
+            (
+                "<div style='padding:4px 0 8px 0; font-size:13px;'>"
+                f"현재 작업: <strong>{html.escape(str(current_job.get('name', '-') or '-'))}</strong>"
+                f" / 상태: <strong>{html.escape(str(current_job.get('status', '-') or '-'))}</strong>"
+                f" / 생성: {_render_timestamp_span(str(current_job.get('created_at', '-') or '-'))}"
+                "</div>"
+            ),
+            height_px=46,
+            scrolling=False,
         )
         if current_job.get("status") == "pending":
             pending_pos, pending_total = _pending_position(str(current_job.get("job_id", "")))
             if pending_pos > 0:
                 st.info(f"대기 순번: {pending_pos}/{pending_total} (워커 {queue_manager.worker_count}개)")
+        elif current_job.get("status") == "canceled":
+            st.warning(current_job.get("result", {}).get("message", "작업이 중단되었습니다."))
         if current_job.get("status") == "succeeded":
             message = ""
             if current_job.get("result"):
@@ -633,6 +985,7 @@ def _render_queue_status(
         history_path = str(current_job.get("history_path", "")).strip()
         if history_path:
             st.caption(f"작업 스냅샷: {history_path}")
+        _render_job_diagnostics(current_job, key_suffix=f"compact_diag_{current_job.get('job_id', '')}")
         _render_job_logs(current_job, key_suffix=f"compact_{current_job.get('job_id', '')}", height_px=220)
         return has_active_jobs
 
@@ -648,7 +1001,20 @@ def _render_queue_status(
         }
         for job in jobs
     ]
-    st.dataframe(rows, width='stretch', hide_index=True)
+    _render_simple_html_table(
+        rows,
+        columns=[
+            ("job_id", "job_id"),
+            ("owner_label", "계정"),
+            ("name", "작업"),
+            ("status", "상태"),
+            ("created_at", "생성"),
+            ("started_at", "시작"),
+            ("finished_at", "종료"),
+        ],
+        height_px=260,
+        empty_text="등록된 작업이 없습니다.",
+    )
 
     job_ids = [job["job_id"] for job in jobs]
     default_job_id = st.session_state.get("selected_job_id")
@@ -674,6 +1040,8 @@ def _render_queue_status(
     elif job["status"] == "failed":
         st.error(job.get("error") or "작업 실패")
         _render_retry_button(job, button_key=f"retry_detail_{job.get('job_id', '')}")
+    elif job["status"] == "canceled":
+        st.warning(job.get("result", {}).get("message", "작업이 중단되었습니다."))
 
     if job.get("status") == "pending":
         pending_pos, pending_total = _pending_position(str(job.get("job_id", "")))
@@ -683,6 +1051,7 @@ def _render_queue_status(
     history_path = str(job.get("history_path", "")).strip()
     if history_path:
         st.caption(f"작업 스냅샷: {history_path}")
+    _render_job_diagnostics(job, key_suffix=f"detail_diag_{job.get('job_id', '')}")
 
     _render_job_logs(job, key_suffix=f"detail_{job.get('job_id', '')}", height_px=260)
 
@@ -708,7 +1077,12 @@ def _render_live_queue_and_logs_fragment(
     )
     st.subheader("실행 로그")
     recent_logs = list(st.session_state.logs[-500:]) if st.session_state.logs else []
-    _render_scrollable_log_block(recent_logs, height_px=260, empty_text="(아직 로그 없음)")
+    _render_scrollable_log_block(
+        recent_logs,
+        height_px=260,
+        empty_text="(아직 로그 없음)",
+        state_key="session-live",
+    )
     if has_active_jobs:
         st.caption("실시간 로그 업데이트: ON")
     else:
@@ -818,6 +1192,257 @@ flowchart TB
 </script>
 """
     components.html(mermaid_html, height=comp_height, scrolling=True)
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _load_recent_failure_bundles(limit: int = 12) -> list[dict[str, Any]]:
+    root = Path(".runtime") / "job_diagnostics"
+    if not root.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for summary_path in sorted(root.glob("*/summary.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        payload = _read_json_file(summary_path)
+        if not payload:
+            continue
+        job = payload.get("job") if isinstance(payload.get("job"), dict) else {}
+        diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+        artifact_rows = [row for row in payload.get("artifact_paths", []) if isinstance(row, dict)]
+        exam_summary = diagnostics.get("last_exam_summary") if isinstance(diagnostics.get("last_exam_summary"), dict) else {}
+        rows.append(
+            {
+                "finished_at": str(job.get("finished_at", "") or ""),
+                "job_id": str(job.get("job_id", "") or ""),
+                "job_name": str(job.get("name", "") or ""),
+                "owner_label": str(job.get("owner_label", "") or job.get("owner", "") or ""),
+                "error": str(job.get("error", "") or ""),
+                "course_title": str(diagnostics.get("last_course_title", "") or ""),
+                "lesson_title": str(diagnostics.get("last_lesson_title", "") or ""),
+                "run_id": str(diagnostics.get("run_id", "") or ""),
+                "artifact_count": len(artifact_rows),
+                "exam_solved": int(exam_summary.get("solved", 0) or 0) if exam_summary else 0,
+                "summary_path": summary_path.as_posix(),
+                "history_path": str(job.get("history_path", "") or ""),
+            }
+        )
+        if len(rows) >= max(1, limit):
+            break
+    return rows
+
+
+def _load_exam_quality_report_overview(limit: int = 12) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    root = Path("logs") / "exam_quality_reports"
+    if not root.exists():
+        return {"reports": 0, "alignment_ok": 0, "warnings": 0, "legacy_warnings": 0}, []
+    rows: list[dict[str, Any]] = []
+    alignment_ok = 0
+    warnings = 0
+    legacy_warnings = 0
+    for report_path in sorted(root.glob("exam_quality_*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        payload = _read_json_file(report_path)
+        if not payload:
+            continue
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+        report_rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+        questions = int(summary.get("questions", 0) or 0)
+        matched = int(summary.get("matched_result_entries", 0) or 0)
+        known = int(summary.get("correctness_known", 0) or 0)
+        correct = int(summary.get("correct", 0) or 0)
+        rich_rows = sum(
+            1
+            for row in report_rows
+            if isinstance(row, dict)
+            and str(row.get("question_norm", "") or "").strip()
+            and isinstance(row.get("options"), list)
+            and len([x for x in row.get("options", []) if str(x).strip()]) >= 2
+        )
+        detail_coverage = (float(rich_rows) / float(questions)) if questions > 0 else 0.0
+        match_gap = max(0, questions - matched)
+        known_gap = max(0, questions - known)
+        accuracy = (float(correct) / float(known)) if known > 0 else 0.0
+        is_ok = questions > 0 and matched >= questions and known >= questions
+        is_legacy = (not is_ok) and questions > 0 and detail_coverage < 0.35
+        if is_ok:
+            alignment_ok += 1
+        else:
+            if is_legacy:
+                legacy_warnings += 1
+            else:
+                warnings += 1
+        rows.append(
+            {
+                "created_at": str(meta.get("created_at", "") or ""),
+                "course_title": str(meta.get("course_title", "") or ""),
+                "attempt_no": int(meta.get("attempt_no", 0) or 0),
+                "questions": questions,
+                "matched": matched,
+                "known": known,
+                "correct": correct,
+                "accuracy_pct": round(accuracy * 100, 1),
+                "match_gap": match_gap,
+                "known_gap": known_gap,
+                "status": "ok" if is_ok else ("legacy-warn" if is_legacy else "warn"),
+                "path": report_path.as_posix(),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            0 if str(row.get("status")) == "warn" else 1,
+            -int(row.get("match_gap", 0)),
+            -int(row.get("known_gap", 0)),
+            float(row.get("accuracy_pct", 0.0)),
+            str(row.get("created_at", "")),
+        )
+    )
+    return {
+        "reports": len(rows[: max(1, limit)]),
+        "alignment_ok": alignment_ok,
+        "warnings": warnings,
+        "legacy_warnings": legacy_warnings,
+    }, rows[: max(1, limit)]
+
+
+def _load_latest_proxy_preflight() -> dict[str, Any] | None:
+    path = Path(".runtime") / "proxy_preflight_latest.json"
+    payload = _read_json_file(path)
+    if not payload:
+        return None
+    return payload
+
+
+def _render_admin_failure_dashboard() -> None:
+    st.subheader("최근 실패 작업")
+    rows = _load_recent_failure_bundles(limit=15)
+    if not rows:
+        st.caption("저장된 실패 진단 번들이 아직 없습니다.")
+        return
+    m1, m2, m3 = st.columns(3)
+    m1.metric("실패 번들", len(rows))
+    m2.metric("아티팩트 포함", sum(1 for row in rows if int(row.get("artifact_count", 0)) > 0))
+    m3.metric("시험 관여 실패", sum(1 for row in rows if int(row.get("exam_solved", 0)) > 0))
+    table_rows = [
+        {
+            "finished_at": row["finished_at"],
+            "job_id": row["job_id"],
+            "job_name": row["job_name"],
+            "course_title": row["course_title"],
+            "lesson_title": row["lesson_title"],
+            "artifact_count": row["artifact_count"],
+            "summary_path": row["summary_path"],
+        }
+        for row in rows
+    ]
+    _render_simple_html_table(
+        table_rows,
+        columns=[
+            ("finished_at", "종료"),
+            ("job_id", "job_id"),
+            ("job_name", "작업"),
+            ("course_title", "과정"),
+            ("lesson_title", "차시"),
+            ("artifact_count", "artifact"),
+            ("summary_path", "summary_path"),
+        ],
+        height_px=280,
+        empty_text="저장된 실패 진단 번들이 아직 없습니다.",
+    )
+    selected_path = st.selectbox(
+        "실패 진단 상세",
+        options=[row["summary_path"] for row in rows],
+        format_func=lambda path: next((f"{row['finished_at']} / {row['job_name']}" for row in rows if row["summary_path"] == path), path),
+        key="admin_failure_bundle_select",
+    )
+    selected = next((row for row in rows if row["summary_path"] == selected_path), None)
+    if selected:
+        st.caption(f"진단 번들: {selected['summary_path']}")
+        if selected.get("history_path"):
+            st.caption(f"작업 스냅샷: {selected['history_path']}")
+        detail_lines = [
+            f"job_id={selected['job_id']}",
+            f"job_name={selected['job_name']}",
+            f"owner={selected['owner_label']}",
+            f"course={selected['course_title']}",
+            f"lesson={selected['lesson_title']}",
+            f"run_id={selected['run_id']}",
+            f"error={selected['error']}",
+        ]
+        st.code("\n".join(detail_lines))
+
+
+def _render_admin_exam_quality_dashboard() -> None:
+    st.subheader("시험 품질 리포트")
+    stats, rows = _load_exam_quality_report_overview(limit=15)
+    if not rows:
+        st.caption("시험 품질 리포트가 아직 없습니다.")
+        return
+    q1, q2, q3 = st.columns(3)
+    q1.metric("최근 리포트", stats["reports"])
+    q2.metric("정합 OK", stats["alignment_ok"])
+    q3.metric("경고", stats["warnings"])
+    if int(stats.get("legacy_warnings", 0)) > 0:
+        st.caption(f"legacy 경고: {int(stats.get('legacy_warnings', 0))}건")
+    _render_simple_html_table(
+        rows,
+        columns=[
+            ("created_at", "생성"),
+            ("course_title", "과정"),
+            ("attempt_no", "시도"),
+            ("questions", "문항"),
+            ("matched", "matched"),
+            ("known", "known"),
+            ("correct", "correct"),
+            ("accuracy_pct", "정답률(%)"),
+            ("status", "상태"),
+            ("path", "path"),
+        ],
+        height_px=300,
+        empty_text="시험 품질 리포트가 아직 없습니다.",
+    )
+
+
+def _render_admin_proxy_dashboard() -> None:
+    st.subheader("현재 Egress / 프록시 프리플라이트")
+    payload = _load_latest_proxy_preflight()
+    if not payload:
+        st.caption("저장된 프록시 프리플라이트 결과가 아직 없습니다.")
+        return
+    proxy = payload.get("proxy") if isinstance(payload.get("proxy"), dict) else {}
+    egress = payload.get("egress") if isinstance(payload.get("egress"), dict) else {}
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("required", str(bool(proxy.get("required", False))))
+    p2.metric("target", str(proxy.get("target_country", "") or "-"))
+    p3.metric("detected", str(egress.get("country", "") or "-"))
+    p4.metric("status", str(payload.get("status", "") or "-"))
+    detail_rows = [
+        {
+            "checked_at": str(payload.get("checked_at", "") or ""),
+            "server": str(proxy.get("server", "") or ""),
+            "provider": str(egress.get("provider", "") or ""),
+            "ip": str(egress.get("ip", "") or ""),
+            "country": str(egress.get("country", "") or ""),
+            "message": str(payload.get("message", "") or ""),
+        }
+    ]
+    _render_simple_html_table(
+        detail_rows,
+        columns=[
+            ("checked_at", "확인시각"),
+            ("server", "proxy"),
+            ("provider", "provider"),
+            ("ip", "ip"),
+            ("country", "country"),
+            ("message", "message"),
+        ],
+        height_px=110,
+        empty_text="프록시 프리플라이트 결과가 없습니다.",
+    )
 
 
 def main() -> None:
@@ -1002,38 +1627,38 @@ def main() -> None:
             ),
             (
                 "M4 강의 재생·완료처리",
-                "96%",
-                "차시 진행률 판독 + 파란색 완료 확인 + 우하단 Next로 다음 차시 반복 처리",
+                "97%",
+                "차시 진행률 판독 + 미완료 차시 직접 진입 + 내부 next/우하단 Next 분리 처리",
             ),
             (
                 "M5 수료 순서 자동화",
-                "95%",
-                "원클릭 실행 + 진도율→학습시간→시험 + 계정 동기화 후 Start 분리 + 시험 우회/재응시/인덱싱 고도화",
+                "96%",
+                "원클릭 실행 + 진도율→학습시간→시험 + 계정 동기화 후 Start 분리 + 미수료 차시 우선 보완",
             ),
             (
                 "M6 종합평가 안정화",
-                "96%",
-                "문항 추출/제출/재응시/응시횟수 보호 및 결과 판독 안정화",
+                "97%",
+                "structured 문항 추출 + 결과지 인덱싱/재응시/응시횟수 보호 및 품질 fail-fast",
             ),
             (
                 "M7 RAG 풀이 고도화",
-                "96%",
+                "98%",
                 "문항 정규화/보기 순서 불변 매칭 + 오답 근거 전환 + 품질 리포트",
             ),
             (
                 "M8 원격 실행 서버화",
-                "90%",
+                "91%",
                 "Streamlit user/admin 분리 + LaunchAgent + Tunnel 운영 안정화",
             ),
             (
                 "M9 동시성/대기열",
-                "96%",
-                "APP_WORKER_COUNT=5 기준 동시 처리 + 초과 pending + 중복 실행 차단",
+                "97%",
+                "APP_WORKER_COUNT=5 기준 동시 처리 + 초과 pending + 중복 실행 차단 + 실패 진단 번들",
             ),
             (
                 "M10 운영/복구",
-                "90%",
-                "작업 스냅샷 영속 + 계정별 로그/현황 + 실패 재시도/디버그 산출물 강화",
+                "96%",
+                "작업 스냅샷 + job diagnostics + 시험 품질 리포트 + UI 추적성 강화",
             ),
         ]
         row_size = 5
@@ -1059,6 +1684,9 @@ def main() -> None:
             st.metric("전체 Running", overall_stats["running"])
         with op_col4:
             st.metric("전체 Failed", overall_stats["failed"])
+        _render_admin_proxy_dashboard()
+        _render_admin_failure_dashboard()
+        _render_admin_exam_quality_dashboard()
 
     if "account_sync_state" not in st.session_state:
         st.session_state.account_sync_state = {}
@@ -1352,12 +1980,30 @@ def main() -> None:
 
     one_click_button_label = "원클릭 전체 자동 실행 (인덱스 확인 → 수료 자동)" if is_admin else "START"
     one_click_disabled = (not is_admin) and (not sync_ready)
-    run_one_click = st.button(
-        one_click_button_label,
-        type="primary",
-        width='stretch',
-        disabled=one_click_disabled,
-    )
+    active_queue_job = queue_manager.find_active_job(owner=queue_owner_key) if queue_owner_key else None
+    start_col, stop_col = st.columns([5, 1])
+    with start_col:
+        run_one_click = st.button(
+            one_click_button_label,
+            type="primary",
+            width='stretch',
+            disabled=one_click_disabled,
+        )
+    with stop_col:
+        stop_current_job = st.button(
+            "STOP",
+            width='stretch',
+            disabled=active_queue_job is None,
+        )
+    if stop_current_job:
+        if active_queue_job is not None and queue_manager.cancel_job(
+            str(active_queue_job.get("job_id", "")),
+            owner=queue_owner_key or None,
+        ):
+            st.session_state.selected_job_id = str(active_queue_job.get("job_id", st.session_state.get("selected_job_id", "")))
+            st.warning("중단 요청을 전송했습니다. 현재 단계 종료 후 작업이 멈춥니다.")
+        else:
+            st.info("중단할 실행 중 작업이 없습니다.")
     show_flow = st.toggle(
         "실행 알고리즘 보기",
         value=False,
@@ -1408,12 +2054,13 @@ def main() -> None:
             settings,
             queue_manager,
             "원클릭 전체 자동 실행",
-            lambda log_fn, s=task_settings: _run_one_click(
+            lambda log_fn, stop_fn, s=task_settings: _run_one_click(
                 s,
                 check_interval_minutes=timefill_check_interval_min,
                 max_timefill_checks=timefill_check_limit,
                 force_reindex=one_click_force_reindex,
                 log_fn=log_fn,
+                stop_requested=stop_fn,
             ),
             owner=queue_owner_key,
             owner_label=queue_owner_label,
@@ -1427,7 +2074,7 @@ def main() -> None:
             settings,
             queue_manager,
             "로그인 테스트",
-            lambda log_fn, s=task_settings: _run_automator_method(s, "login", log_fn),
+            lambda log_fn, stop_fn, s=task_settings: _run_automator_method(s, "login", log_fn, stop_fn),
             owner=queue_owner_key,
             owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
@@ -1440,7 +2087,9 @@ def main() -> None:
             settings,
             queue_manager,
             "로그인 + 나의 학습현황 이동",
-            lambda log_fn, s=task_settings: _run_automator_method(s, "login_and_open_learning_status", log_fn),
+            lambda log_fn, stop_fn, s=task_settings: _run_automator_method(
+                s, "login_and_open_learning_status", log_fn, stop_fn
+            ),
             owner=queue_owner_key,
             owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
@@ -1453,7 +2102,9 @@ def main() -> None:
             settings,
             queue_manager,
             "첫 과목 학습 시작",
-            lambda log_fn, s=task_settings: _run_automator_method(s, "login_and_enter_first_course", log_fn),
+            lambda log_fn, stop_fn, s=task_settings: _run_automator_method(
+                s, "login_and_enter_first_course", log_fn, stop_fn
+            ),
             owner=queue_owner_key,
             owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
@@ -1466,10 +2117,11 @@ def main() -> None:
             settings,
             queue_manager,
             "강의 순차 완료",
-            lambda log_fn, s=task_settings, sr=stop_rule, ml=manual_lesson_limit: _run_automator_method(
+            lambda log_fn, stop_fn, s=task_settings, sr=stop_rule, ml=manual_lesson_limit: _run_automator_method(
                 s,
                 "login_and_complete_first_course_lesson",
                 log_fn,
+                stop_fn,
                 stop_rule=sr,
                 manual_lesson_limit=ml,
             ),
@@ -1485,10 +2137,11 @@ def main() -> None:
             settings,
             queue_manager,
             "종합평가 텍스트 탐침",
-            lambda log_fn, s=task_settings, limit=exam_probe_limit: _run_automator_method(
+            lambda log_fn, stop_fn, s=task_settings, limit=exam_probe_limit: _run_automator_method(
                 s,
                 "login_and_probe_comprehensive_exam",
                 log_fn,
+                stop_fn,
                 max_questions=limit,
             ),
             owner=queue_owner_key,
@@ -1503,10 +2156,11 @@ def main() -> None:
             settings,
             queue_manager,
             "수료 순서 자동",
-            lambda log_fn, s=task_settings: _run_automator_method(
+            lambda log_fn, stop_fn, s=task_settings: _run_automator_method(
                 s,
                 "login_and_run_completion_workflow",
                 log_fn,
+                stop_fn,
                 check_interval_minutes=timefill_check_interval_min,
                 max_timefill_checks=timefill_check_limit,
             ),
@@ -1522,7 +2176,7 @@ def main() -> None:
             settings,
             queue_manager,
             "RAG 인덱스 생성",
-            lambda log_fn, s=task_settings: _run_rag_index(s, log_fn),
+            lambda log_fn, stop_fn, s=task_settings: _run_rag_index(s, log_fn, stop_fn),
             owner=queue_owner_key,
             owner_label=queue_owner_label,
             role="admin" if is_admin else "user",
@@ -1535,10 +2189,11 @@ def main() -> None:
             settings,
             queue_manager,
             "종합평가 LLM 풀이(RAG)",
-            lambda log_fn, s=task_settings: _run_automator_method(
+            lambda log_fn, stop_fn, s=task_settings: _run_automator_method(
                 s,
                 "login_and_solve_exam_with_rag",
                 log_fn,
+                stop_fn,
                 max_questions=60,
                 rag_top_k=rag_top_k,
                 confidence_threshold=rag_conf_threshold,

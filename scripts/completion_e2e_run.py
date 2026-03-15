@@ -80,6 +80,9 @@ def main() -> int:
         "remaining_attempt_skip_count": _count_matches(logs, r"종합평가 잔여 응시 .* 우회"),
         "exam_retry_count": _count_matches(logs, r"종합평가 자동 재응시 시작"),
         "answer_bank_match_count": _count_matches(logs, r"정답 인덱스 매칭 사용"),
+        "proxy_preflight_ok_count": _count_matches(logs, r"proxy-preflight-ok"),
+        "proxy_preflight_fail_count": _count_matches(logs, r"proxy-preflight-(?:mismatch|failed|unknown)"),
+        "counter_source_mismatch_count": _count_matches(logs, r"counter-source-mismatch"),
     }
 
     payload: dict[str, Any] = {
@@ -98,6 +101,7 @@ def main() -> int:
             "message": str(result.message),
             "url": str(result.current_url),
         },
+        "diagnostics": automator.get_runtime_diagnostics(),
         "metrics": metrics,
         "log_count": len(logs),
         "logs_tail": logs[-120:],

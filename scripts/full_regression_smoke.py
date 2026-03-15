@@ -77,10 +77,32 @@ def main() -> int:
                 r"학습시간 .*충족",
             ],
         ),
-        "exam_seen": _contains_any(logs, [r"종합평가", r"시험평가"]),
+        "comprehensive_exam_seen": _contains_any(
+            logs,
+            [
+                r"comprehensive-exam-opened",
+                r"종합평가 자동",
+                r"시험 자동 풀이",
+                r"종합평가 .*응시 시작",
+                r"종합평가 .*응시하기",
+            ],
+        ),
+        "inline_quiz_seen": _contains_any(logs, [r"inline-quiz-detected", r"inline-quiz-advanced", r"inline-quiz-gate-opened"]),
+        "round_next_seen": _contains_any(logs, [r"round-next-clicked"]),
+        "final_next_seen": _contains_any(logs, [r"final-next-clicked"]),
+        "incomplete_lesson_opened_seen": _contains_any(logs, [r"incomplete-lesson-opened"]),
+        "completed_lesson_skipped_seen": _contains_any(logs, [r"completed-lesson-skipped"]),
+        "resume_fallback_seen": _contains_any(logs, [r"resume-fallback-opened"]),
+        "same_completed_lesson_reopened_seen": _contains_any(logs, [r"same-completed-lesson-reopened"]),
+        "lesson_progress_unchanged_seen": _contains_any(logs, [r"lesson-progress-still-unchanged"]),
+        "counter_source_mismatch_seen": _contains_any(logs, [r"counter-source-mismatch"]),
         "bypass_seen": _contains_any(logs, [r"우회", r"deferred"]),
         "numeric_strict_seen": _contains_any(logs, [r"숫자 문항 엄격 검증 적용", r"strict-numeric"]),
         "negative_evidence_seen": _contains_any(logs, [r"Negative Evidence 감점 적용"]),
+        "exam_quality_ok_seen": _contains_any(logs, [r"시험 파싱 품질 확인"]),
+        "exam_quality_warn_seen": _contains_any(logs, [r"시험 파싱 품질 경고"]),
+        "proxy_preflight_ok_seen": _contains_any(logs, [r"proxy-preflight-ok"]),
+        "proxy_preflight_mismatch_seen": _contains_any(logs, [r"proxy-preflight-mismatch", r"proxy-preflight-failed"]),
     }
 
     payload: dict[str, Any] = {
@@ -98,6 +120,7 @@ def main() -> int:
             "message": str(result.message),
             "url": str(result.current_url),
         },
+        "diagnostics": automator.get_runtime_diagnostics(),
         "markers": markers,
         "log_count": len(logs),
         "logs_tail": logs[-200:],
@@ -111,12 +134,22 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    strict_ok = bool(markers["timefill_seen"] and markers["exam_seen"] and markers["bypass_seen"])
+    strict_ok = bool(markers["timefill_seen"] and markers["comprehensive_exam_seen"] and markers["bypass_seen"])
     print(
         "full-smoke: "
         f"success={result.success} "
-        f"timefill={markers['timefill_seen']} exam={markers['exam_seen']} bypass={markers['bypass_seen']} "
-        f"numeric={markers['numeric_strict_seen']} neg_evidence={markers['negative_evidence_seen']}"
+        f"timefill={markers['timefill_seen']} comprehensive_exam={markers['comprehensive_exam_seen']} "
+        f"inline_quiz={markers['inline_quiz_seen']} round_next={markers['round_next_seen']} "
+        f"final_next={markers['final_next_seen']} incomplete_lesson={markers['incomplete_lesson_opened_seen']} "
+        f"completed_skipped={markers['completed_lesson_skipped_seen']} "
+        f"resume_fallback={markers['resume_fallback_seen']} "
+        f"same_completed_reopened={markers['same_completed_lesson_reopened_seen']} "
+        f"progress_unchanged={markers['lesson_progress_unchanged_seen']} "
+        f"counter_mismatch={markers['counter_source_mismatch_seen']} "
+        f"proxy_ok={markers['proxy_preflight_ok_seen']} proxy_fail={markers['proxy_preflight_mismatch_seen']} "
+        f"bypass={markers['bypass_seen']} "
+        f"numeric={markers['numeric_strict_seen']} neg_evidence={markers['negative_evidence_seen']} "
+        f"exam_quality_ok={markers['exam_quality_ok_seen']} exam_quality_warn={markers['exam_quality_warn_seen']}"
     )
     print(f"report_path={out}")
 
@@ -127,4 +160,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

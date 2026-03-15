@@ -1,6 +1,6 @@
 # e-KHNP Automation - Next Steps
 
-Last updated: 2026-03-11
+Last updated: 2026-03-12
 
 ## 현재 스냅샷
 - 핵심 자동화(로그인, 강의실 진입, 차시 처리, 수료표 파싱)까지는 구현됨.
@@ -97,18 +97,29 @@ Last updated: 2026-03-11
     - embed/web 캐시 상한 도입(메모리 보호)
     - 모델 응답 파싱 길이 상한 도입
     - 일일 로그 파일 권한 `0600` 강제
+- 2026-03-12 반영/검증:
+  - 차시 이동 로직 보강:
+    - 우측 하단 동그라미 화살표(`#nextPage`)를 우선 클릭 경로로 반영
+    - 단, 기본 다형태(`다음/Next`, `>`, `›`, `»`, `→`, 아이콘/이미지`) 탐지 로직은 그대로 유지
+    - 성공 판정은 고정 `1/2 -> 2/2`가 아닌 `pageInfoDiv`의 현재 페이지 번호 증가(`cur` 상승) 기준으로 반영
+  - 강제 전환 보강:
+    - `다음 클릭 무변화` 케이스에서도 `#nextPage + pageInfoDiv` 증가 검증 경로를 우선 사용하도록 반영
+  - 실검증(특수 케이스):
+    - `공공 통일교육`에서 `2번째 학습하기` 진입 후 우측 하단 동그라미 `>` 클릭 시 `pageInfoDiv: 1 / 2 -> 2 / 2` 확인
+  - 테스트용 임시 분기 정리:
+    - `미완료 2차시 우선` 테스트용 임시 코드 추가/검증 후 원복 완료
 
 ## 마일스톤 (업데이트)
 - M1 프로젝트 골격: 100% 완료
 - M2 로그인/포털 이동 자동화: 99% 완료
 - M3 강의실 진입/학습차시 탐색: 97% 완료
-- M4 학습 재생/차시 완료 루프: 96% 완료
-- M5 수료 순서 자동화(진도→시간→시험): 95% 진행중
-- M6 종합평가 자동화 안정화: 96% 진행중
+- M4 학습 재생/차시 완료 루프: 97% 완료
+- M5 수료 순서 자동화(진도→시간→시험): 96% 진행중
+- M6 종합평가 자동화 안정화: 97% 진행중
 - M7 LLM(RAG) 기반 시험풀이 고도화: 98% 진행중
-- M8 원격 실행 서버화(Streamlit+Tunnel+Worker): 90% 진행중
-- M9 동시성 제어(최대 5명) + 대기열: 96% 진행중
-- M10 운영(로그/모니터링/복구): 94% 진행중
+- M8 원격 실행 서버화(Streamlit+Tunnel+Worker): 91% 진행중
+- M9 동시성 제어(최대 5명) + 대기열: 97% 진행중
+- M10 운영(로그/모니터링/복구): 96% 진행중
 
 ## 완료된 작업
 - 로그인, `My학습포털 > 나의 학습현황` 이동.
@@ -247,6 +258,70 @@ Last updated: 2026-03-11
   - 성능/보안 감사 리포트: `logs/security_perf_audit_report.json` (`security_findings=0`, worker5 부하 통과)
   - 큐 부하 최종 리포트: `logs/queue_load_report_final.json` (`max_running_observed=5`, `pending_seen=true`)
   - 실계정 시험 진입 점검: `logs/exam_live_run_report1.json`, `logs/exam_live_run_report2.json` 모두 `학습진도율 75%(응시조건 미달)`로 시험 단계 미진입 확인
+- 2026-03-12 운영/검증 추가:
+  - answer-bank 셔플 대량 회귀: `scripts/answer_bank_shuffle_check.py --shuffles 500` 결과 `trials=19000, pass=19000, fail=0`
+  - 우회 이력 계정 격리 재검증: `logs/deferred_course_history_check_latest.json` (`isolation_ok=true`, `skip_chain_ok=true`)
+  - 워커5 장시간 부하: `logs/queue_load_report_longrun.json` (`jobs=300`, `max_running_observed=5`, `all_succeeded=true`)
+  - 백프레셔(대기열 상한) 검증: `max_pending=12` 설정에서 `submitted=30 -> accepted=12 / rejected=18`
+  - 실시간 로그/관리자 집계 정합 검증(큐 단위): 로그 카운트 단조증가, owner 집계와 전체 stats 일치 확인
+  - RAG 문서셋 동기화 후 재인덱싱: `rag_data/project/{README,NEXT_STEPS}.md` 최신화 + `logs/rag_reindex_report_latest.json`
+  - OCR 폴백 경로 보강: `shutil.which` 실패 시 `/opt/homebrew/bin/tesseract`, `/usr/local/bin/tesseract` 자동 탐색
+  - 차시전환 루프 보강:
+    - 우하단 동그라미 `>` 클릭 성공 판정을 `click 수행`이 아니라 `pageInfoDiv 증가`로 고정
+    - `pageInfoDiv`와 `next` 버튼이 서로 다른 frame에 있어도 교차 프레임으로 증가 여부 검증
+    - 원형 아이콘-only 플레이어 대응: 우하단 원형 버튼군에서 가장 오른쪽 버튼을 `next`로 우선 선택
+  - 학습평가(퀴즈) 게이트 처리 추가:
+    - `선택지 선택 -> 정답확인 -> 다음문제/결과보기`를 단계 루프에서 자동 처리
+    - 단일 액션이 아니라 다회(최대 6회) 연속 처리로 후속 버튼까지 소진
+  - strict E2E 재검증(최신):
+    - `통합보안교육`에서 퀴즈 게이트(`quiz-next-btn`, `quiz-result-btn`) 처리 로그는 확인
+    - 그럼에도 `1/2 -> 2/2` 단계 증가 실패가 반복되어 `진도율 단계 중단`으로 종료
+    - 최신 리포트: `logs/full_smoke_report_latest.json`
+  - strict E2E 실주행:
+    - 1차: 시간보충 체크 제한(1회)으로 중단 (`logs/full_smoke_report_latest.json`)
+    - 2차: 공공 통일교육 1개 수료 후 통합보안교육 진입, 차시 자동진행 중 `nextPage 클릭 성공 후 단계 미증가` 정체 반복 재현
+    - 정체 시 디버그 아티팩트 확보: `artifacts/player_debug/progress_not_found*.png`, `step_not_blue*.png`, `recovery_failed*.png`
+  - 서버 반영/재시작/헬스체크 완료:
+    - `scripts/install_launchagents.sh` 재실행 후 user/admin/cloudflared running
+    - `http://127.0.0.1:8501` / `:8502` HTTP 200
+    - `.khnp-launch-runtime` 핵심 파일 해시 일치 확인
+- 2026-03-15 운영/검증 추가:
+  - `학습 차시` 직접 진입 보강:
+    - `통합보안교육` 24차시 목록을 구조적으로 파싱하고 `미완료 일반 차시의 학습 하기` 우선 선택
+    - `학습완료` 차시 재수강 방지, `학습평가`는 게이트 처리용으로만 분리
+  - 차시 내부/차시 완료 버튼 분리:
+    - `round-next-clicked`와 `final-next-clicked`를 실제 런타임 로그에서 분리 확인
+    - 내부 페이지는 `동그라미 > / nextPage` 우선, 마지막에만 `우하단 Next`
+  - 시험 인덱싱/매칭 보강:
+    - 활성 `quiz_li` 기반 structured 문항 추출, option-set fallback, 결과지 dedupe 보강
+    - `통합보안교육` 종합평가 재검증 결과 `solved=10`, `matched_result_entries=10`, answer-bank `9 -> 10`
+    - 품질 리포트: `logs/exam_quality_reports/exam_quality_20260315_023103_통합보안교육_try01.json`
+    - `알기쉬운 이해충돌방지법(courseActiveSeq=12390)` 신규 케이스에서 hidden radio/label 기반 보기 DOM을 추가 대응
+    - 재검증 결과 `try01` 학습 후 `try02` 자동 재응시 성공 + 수료 확인
+    - 품질 리포트: `logs/exam_quality_reports/exam_quality_20260315_073340_알기쉬운_이해충돌방지법_try01.json`, `logs/exam_quality_reports/exam_quality_20260315_073416_알기쉬운_이해충돌방지법_try02.json`
+  - 시험 품질 fail-fast 추가:
+    - 결과지 매칭 수가 문항 수와 다르면 `시험 파싱 품질 경고` 로그를 남기고 자동 재응시 전 중단/확인 가능
+    - 품질 묶음 최신 집계: `logs/exam_quality_report_check_latest.json` (`reports=8`, `alignment_ok=3`, `warnings=5`)
+  - 실패 작업 진단 번들 추가:
+    - 작업 실패 시 `.runtime/job_diagnostics/<job_id>/summary.json`, `logs_tail.txt`, `traceback.txt` 자동 저장
+    - 플레이어 디버그는 `artifacts/player_debug/<run_id>/...` 로 run 단위 분리
+    - Streamlit 작업 상세에서 `작업 스냅샷`, `진단 번들`, `진단 정보` 바로 확인 가능
+    - 관리자 화면에 `최근 실패 작업`, `시험 품질 리포트` 대시보드 추가
+    - 묶음 점검 스크립트: `scripts/exam_quality_report_check.py` → `logs/exam_quality_report_check_latest.json`
+  - 2026-03-15 추가 운영 보강:
+    - 큐 싱글턴 재설정 지원: 런타임 중 `APP_WORKER_COUNT` 증분 반영, 활성 워커 수 UI 노출
+    - 시간 표시 정책 고정: 저장은 UTC, UI/작업 로그는 접속자 브라우저 로컬 시간대로 렌더링
+    - 현재 작업 로그 전체 스크롤 지원: compact/detail 모두 과거 로그 확인 가능
+    - 플레이어 상태 분리: `내부 페이지 진행`과 `차시 단계 상태`를 별도로 판정, `counter-source-mismatch` 로그/디버그 추가
+    - 학습창 복구 시 `이어 학습하기`보다 마지막 미완료 차시 직접 재오픈 우선
+    - 프록시/KR egress 프리플라이트 추가: `.runtime/proxy_preflight_latest.json`
+    - 시험 경고 과정은 `warning_snapshots`로 별도 저장
+  - 2사이클 실주행:
+    - `자살예방 생명지킴이 양성교육(보고 듣고 말하기)` 자동 진입 확인 후 큰 시간 부족(`01:34:11`)으로 우회
+    - `인터넷 및 스마트폰 과의존 예방교육` 미완료 차시 진입/진행 확인 후 시간 부족(`00:46:01`)으로 우회
+    - 리포트: `logs/completion_e2e_report_two_cycles.json` (생성 시점상 `max_courses` 성공 처리 직전 파일)
+  - 서버 반영/재시작:
+    - 8501/8502 재기동 후 둘 다 HTTP 200 확인
 
 ## 진행중 작업
 - `anpigon/eeve-korean-10.8b` 모델 다운로드 완료(설치됨). 운영 기본은 qwen 우선 체인으로 유지.
@@ -326,5 +401,7 @@ Last updated: 2026-03-11
    - 실패율
 
 ## Debug Artifacts
-- Folder: `artifacts/player_debug/`
-- Purpose: popup/page/frame text/screenshot inspection on failures.
+- Folder: `artifacts/player_debug/<run_id>/`
+- Purpose: popup/page/frame text/screenshot inspection on failures, run 단위 분리 저장.
+- Failure bundle: `.runtime/job_diagnostics/<job_id>/summary.json`
+- Bundle contents: 작업 메타데이터, 최근 로그 tail, traceback, 관련 artifact 경로 목록
