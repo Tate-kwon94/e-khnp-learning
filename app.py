@@ -888,10 +888,17 @@ def _render_queue_status(
             return
         if st.button("STOP", key=button_key, width='content'):
             owner_key = str(job.get("owner") or "").strip() or None
-            canceled = queue_manager.cancel_job(str(job.get("job_id", "")), owner=owner_key)
-            if canceled:
-                st.session_state.selected_job_id = str(job.get("job_id", st.session_state.get("selected_job_id", "")))
-                st.warning("중단 요청을 전송했습니다. 현재 단계 종료 후 작업이 멈춥니다.")
+            canceled_ids = queue_manager.cancel_active_jobs(owner=owner_key) if owner_key else []
+            if not canceled_ids:
+                canceled = queue_manager.cancel_job(str(job.get("job_id", "")), owner=owner_key)
+                if canceled:
+                    canceled_ids = [str(job.get("job_id", ""))]
+            if canceled_ids:
+                st.session_state.selected_job_id = str(canceled_ids[0] or job.get("job_id", st.session_state.get("selected_job_id", "")))
+                st.warning(
+                    "중단 요청을 전송했습니다. "
+                    f"대상 작업 {len(canceled_ids)}건에 대한 스냅샷/진단 번들도 함께 기록합니다."
+                )
             else:
                 st.info("이미 종료되었거나 중단할 수 없는 작업입니다.")
 
@@ -1996,12 +2003,13 @@ def main() -> None:
             disabled=active_queue_job is None,
         )
     if stop_current_job:
-        if active_queue_job is not None and queue_manager.cancel_job(
-            str(active_queue_job.get("job_id", "")),
-            owner=queue_owner_key or None,
-        ):
-            st.session_state.selected_job_id = str(active_queue_job.get("job_id", st.session_state.get("selected_job_id", "")))
-            st.warning("중단 요청을 전송했습니다. 현재 단계 종료 후 작업이 멈춥니다.")
+        canceled_ids = queue_manager.cancel_active_jobs(owner=queue_owner_key or None)
+        if canceled_ids:
+            st.session_state.selected_job_id = str(canceled_ids[0] or st.session_state.get("selected_job_id", ""))
+            st.warning(
+                "중단 요청을 전송했습니다. "
+                f"대상 작업 {len(canceled_ids)}건에 대한 스냅샷/진단 번들도 함께 기록합니다."
+            )
         else:
             st.info("중단할 실행 중 작업이 없습니다.")
     show_flow = st.toggle(

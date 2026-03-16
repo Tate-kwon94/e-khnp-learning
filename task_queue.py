@@ -179,6 +179,7 @@ class TaskQueueManager:
 
     def cancel_job(self, job_id: str, owner: str | None = None) -> bool:
         snapshot: dict[str, Any] | None = None
+        diagnostic_path = ""
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
@@ -206,9 +207,31 @@ class TaskQueueManager:
                 job.logs.append(f"[{now_iso}] 작업 취소: 사용자 중단 요청")
                 self._trim_logs(job)
                 snapshot = self._snapshot(job)
+            elif job.status == "running":
+                snapshot = self._snapshot(job)
         if snapshot is not None:
+            diagnostic_path = self._persist_failure_bundle(snapshot)
+            if diagnostic_path:
+                snapshot["diagnostic_path"] = diagnostic_path
+                with self._lock:
+                    job = self._jobs.get(job_id)
+                    if job:
+                        job.diagnostic_path = diagnostic_path
             self._persist_job_snapshot(snapshot)
         return True
+
+    def cancel_active_jobs(self, owner: str | None = None) -> list[str]:
+        with self._lock:
+            target_ids = [
+                job.job_id
+                for job in self._jobs.values()
+                if job.status in {"pending", "running"} and (owner is None or job.owner == owner)
+            ]
+        canceled_ids: list[str] = []
+        for job_id in target_ids:
+            if self.cancel_job(job_id, owner=owner):
+                canceled_ids.append(job_id)
+        return canceled_ids
 
     def _is_cancel_requested(self, job_id: str) -> bool:
         with self._lock:
@@ -437,7 +460,7 @@ class TaskQueueManager:
             self._trim_logs(job)
             snapshot = self._snapshot(job)
         diagnostic_path = ""
-        if error:
+        if error or canceled:
             diagnostic_path = self._persist_failure_bundle(snapshot)
         if diagnostic_path:
             snapshot["diagnostic_path"] = diagnostic_path
