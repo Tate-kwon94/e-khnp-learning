@@ -1,0 +1,237 @@
+- generic [ref=e3]:
+  - banner [ref=e6]:
+    - generic [ref=e9]:
+      - generic [ref=e80]:
+        - img "Running..." [ref=e81]:
+          - img [ref=e560]
+        - button "Stop" [ref=e87] [cursor=pointer]
+      - button "Main menu" [ref=e11] [cursor=pointer]:
+        - img [ref=e12]
+  - generic [ref=e15]:
+    - heading "e-KHNP Automation (M5 Workflow Prototype)" [level=1] [ref=e20]:
+      - text: e-KHNP Automation (M5 Workflow Prototype)
+      - generic [ref=e21]:
+        - link "Link to heading":
+          - /url: "#e-khnp-automation-m5-workflow-prototype"
+          - img
+    - paragraph [ref=e59]: "고정 모드: 관리자"
+    - generic [ref=e89]:
+      - alert [ref=e94]:
+        - paragraph [ref=e99]: 관리자 모드 잠금 해제됨
+      - button "관리자 잠금" [ref=e104] [cursor=pointer]:
+        - paragraph [ref=e108]: 관리자 잠금
+    - heading "마일스톤 진행 현황" [level=3] [ref=e113]:
+      - text: 마일스톤 진행 현황
+      - generic [ref=e114]:
+        - link "Link to heading":
+          - /url: "#e52afdc7"
+          - img
+    - generic [ref=e116]:
+      - generic [ref=e121]:
+        - generic [ref=e122]:
+          - paragraph [ref=e124]: M1 프로젝트 골격
+          - button "Help for M1 프로젝트 골격" [ref=e128] [cursor=pointer]:
+            - img [ref=e129]
+        - paragraph [ref=e134]: 100%
+      - generic [ref=e139]:
+        - generic [ref=e140]:
+          - paragraph [ref=e142]: M2 로그인 자동화
+          - button "Help for M2 로그인 자동화" [ref=e146] [cursor=pointer]:
+            - img [ref=e147]
+        - paragraph [ref=e152]: 98%
+      - generic [ref=e157]:
+        - generic [ref=e158]:
+          - paragraph [ref=e160]: M3 학습현황·첫과목 진입
+          - button "Help for M3 학습현황·첫과목 진입" [ref=e164] [cursor=pointer]:
+            - img [ref=e165]
+        - paragraph [ref=e170]: 96%
+      - generic [ref=e175]:
+        - generic [ref=e176]:
+          - paragraph [ref=e178]: M4 강의 재생·완료처리
+          - button "Help for M4 강의 재생·완료처리" [ref=e182] [cursor=pointer]:
+            - img [ref=e183]
+        - paragraph [ref=e188]: 94%
+      - generic [ref=e193]:
+        - generic [ref=e194]:
+          - paragraph [ref=e196]: M5 수료 순서 자동화
+          - button "Help for M5 수료 순서 자동화" [ref=e200] [cursor=pointer]:
+            - img [ref=e201]
+        - paragraph [ref=e206]: 90%
+    - generic [ref=e208]:
+      - paragraph [ref=e211]: 전체 진행률 97%
+      - progressbar "97% Loaded" [ref=e212]
+    - heading "로그인 정보 입력" [level=3] [ref=e220]:
+      - text: 로그인 정보 입력
+      - generic [ref=e221]:
+        - link "Link to heading":
+          - /url: "#2ed1683f"
+          - img
+    - generic [ref=e223]:
+      - generic [ref=e227]:
+        - paragraph [ref=e231]: 아이디
+        - textbox "아이디" [ref=e234]:
+          - /placeholder: 사번 또는 아이디
+      - generic [ref=e238]:
+        - paragraph [ref=e242]: 비밀번호
+        - generic [ref=e244]:
+          - textbox "비밀번호" [ref=e245]
+          - button "Show password text" [ref=e246] [cursor=pointer]:
+            - img "Show password text" [ref=e247]
+    - paragraph [ref=e253]: 입력값은 현재 실행 세션에서만 사용됩니다. 로그에는 비밀번호를 저장하지 않습니다.
+    - generic [ref=e256] [cursor=pointer]:
+      - checkbox "브라우저 창 보기 (디버그용)"
+      - generic [ref=e259]:
+        - paragraph [ref=e261]: 브라우저 창 보기 (디버그용)
+        - button "Help for 브라우저 창 보기 (디버그용)" [ref=e265]:
+          - img [ref=e266]
+    - generic [ref=e270]:
+      - paragraph [ref=e274]: 차시 반복 종료 기준
+      - radiogroup "차시 반복 종료 기준" [ref=e275] [cursor=pointer]:
+        - generic [ref=e276]:
+          - radio "자동(총 차시 감지 우선, 실패 시 Next 버튼 기준)" [checked]
+          - paragraph [ref=e281]: 자동(총 차시 감지 우선, 실패 시 Next 버튼 기준)
+        - generic [ref=e282]:
+          - radio "Next 버튼이 없을 때까지"
+          - paragraph [ref=e287]: Next 버튼이 없을 때까지
+        - generic [ref=e288]:
+          - radio "직접 차시 수 입력"
+          - paragraph [ref=e293]: 직접 차시 수 입력
+    - generic [ref=e295]:
+      - paragraph [ref=e299]: 종합평가 탐침 최대 문항 수
+      - generic [ref=e300]:
+        - spinbutton "종합평가 탐침 최대 문항 수" [ref=e303]: "12"
+        - generic [ref=e304]:
+          - button [ref=e305] [cursor=pointer]:
+            - img [ref=e306]
+          - button [ref=e308] [cursor=pointer]:
+            - img [ref=e309]
+    - generic [ref=e312]:
+      - paragraph [ref=e316]: RAG 문서 폴더
+      - textbox "RAG 문서 폴더" [ref=e319]:
+        - /placeholder: ""
+        - text: rag_data
+    - generic [ref=e321]:
+      - paragraph [ref=e325]: RAG 인덱스 파일
+      - textbox "RAG 인덱스 파일" [ref=e328]:
+        - /placeholder: ""
+        - text: rag/index.json
+    - generic [ref=e330]:
+      - paragraph [ref=e334]: RAG 임베딩 모델
+      - textbox "RAG 임베딩 모델" [ref=e337]:
+        - /placeholder: ""
+        - text: nomic-embed-text
+    - generic [ref=e339]:
+      - paragraph [ref=e343]: RAG 생성 모델
+      - textbox "RAG 생성 모델" [ref=e346]:
+        - /placeholder: ""
+        - text: qwen2.5:7b-instruct
+    - generic [ref=e348]:
+      - paragraph [ref=e352]: RAG top-k
+      - generic [ref=e353]:
+        - spinbutton "RAG top-k" [ref=e356]: "6"
+        - generic [ref=e357]:
+          - button [ref=e358] [cursor=pointer]:
+            - img [ref=e359]
+          - button [ref=e361] [cursor=pointer]:
+            - img [ref=e362]
+    - generic [ref=e365]:
+      - paragraph [ref=e369]: RAG 신뢰도 임계치
+      - generic [ref=e370]:
+        - spinbutton "RAG 신뢰도 임계치" [ref=e373]: "0.65"
+        - generic [ref=e374]:
+          - button [ref=e375] [cursor=pointer]:
+            - img [ref=e376]
+          - button [ref=e378] [cursor=pointer]:
+            - img [ref=e379]
+    - generic [ref=e383]:
+      - checkbox "웹 검색 강제 참조" [checked] [disabled]
+      - generic [ref=e386]:
+        - paragraph [ref=e388]: 웹 검색 강제 참조
+        - button "Help for 웹 검색 강제 참조" [ref=e392] [cursor=pointer]:
+          - img [ref=e393]
+    - generic [ref=e397]:
+      - paragraph [ref=e401]: 웹 검색 상위 결과 수
+      - generic [ref=e402]:
+        - spinbutton "웹 검색 상위 결과 수" [ref=e405]: "4"
+        - generic [ref=e406]:
+          - button [ref=e407] [cursor=pointer]:
+            - img [ref=e408]
+          - button [ref=e410] [cursor=pointer]:
+            - img [ref=e411]
+    - generic [ref=e414]:
+      - paragraph [ref=e418]: 웹 검색 타임아웃(초)
+      - generic [ref=e419]:
+        - spinbutton "웹 검색 타임아웃(초)" [ref=e422]: "8"
+        - generic [ref=e423]:
+          - button [ref=e424] [cursor=pointer]:
+            - img [ref=e425]
+          - button [ref=e427] [cursor=pointer]:
+            - img [ref=e428]
+    - generic [ref=e431]:
+      - paragraph [ref=e435]: 웹 점수 가중치
+      - generic [ref=e436]:
+        - spinbutton "웹 점수 가중치" [ref=e439]: "0.35"
+        - generic [ref=e440]:
+          - button [ref=e441] [cursor=pointer]:
+            - img [ref=e442]
+          - button [ref=e444] [cursor=pointer]:
+            - img [ref=e445]
+    - generic [ref=e448]:
+      - paragraph [ref=e452]: 학습시간 부족 체크 기본 간격(분, 실제 3~10분 동적)
+      - generic [ref=e453]:
+        - spinbutton "학습시간 부족 체크 기본 간격(분, 실제 3~10분 동적)" [ref=e456]: "10"
+        - generic [ref=e457]:
+          - button [ref=e458] [cursor=pointer]:
+            - img [ref=e459]
+          - button [ref=e461] [cursor=pointer]:
+            - img [ref=e462]
+    - generic [ref=e465]:
+      - paragraph [ref=e469]: 학습시간 부족 체크 최대 횟수
+      - generic [ref=e470]:
+        - spinbutton "학습시간 부족 체크 최대 횟수" [ref=e473]: "24"
+        - generic [ref=e474]:
+          - button [ref=e475] [cursor=pointer]:
+            - img [ref=e476]
+          - button [ref=e478] [cursor=pointer]:
+            - img [ref=e479]
+    - generic [ref=e482]:
+      - paragraph [ref=e486]: 수료 자동 최대 과정 수
+      - generic [ref=e487]:
+        - spinbutton "수료 자동 최대 과정 수" [ref=e490]: "20"
+        - generic [ref=e491]:
+          - button [ref=e492] [cursor=pointer]:
+            - img [ref=e493]
+          - button [ref=e495] [cursor=pointer]:
+            - img [ref=e496]
+    - generic [ref=e499]:
+      - paragraph [ref=e503]: 시험 정답 인덱스 파일
+      - textbox "시험 정답 인덱스 파일" [ref=e506]:
+        - /placeholder: ""
+        - text: rag/exam_answer_bank.json
+    - generic [ref=e508]:
+      - paragraph [ref=e512]: 시험 자동 재응시 최대 횟수
+      - generic [ref=e513]:
+        - spinbutton "시험 자동 재응시 최대 횟수" [ref=e516]: "2"
+        - generic [ref=e517]:
+          - button [ref=e518] [cursor=pointer]:
+            - img [ref=e519]
+          - button [ref=e521] [cursor=pointer]:
+            - img [ref=e522]
+    - generic [ref=e526] [cursor=pointer]:
+      - checkbox "정답 인덱스 없으면 재응시 중단" [checked]
+      - generic [ref=e529]:
+        - paragraph [ref=e531]: 정답 인덱스 없으면 재응시 중단
+        - button "Help for 정답 인덱스 없으면 재응시 중단" [ref=e535]:
+          - img [ref=e536]
+    - generic [ref=e541] [cursor=pointer]:
+      - checkbox "원클릭 실행 시 RAG 인덱스 강제 재생성"
+      - generic [ref=e544]:
+        - paragraph [ref=e546]: 원클릭 실행 시 RAG 인덱스 강제 재생성
+        - button "Help for 원클릭 실행 시 RAG 인덱스 강제 재생성" [ref=e550]:
+          - img [ref=e551]
+    - heading "설정 확인" [level=3] [ref=e558]:
+      - text: 설정 확인
+      - generic [ref=e559]:
+        - link "Link to heading":
+          - /url: "#a7fb4eb2"
+          - img

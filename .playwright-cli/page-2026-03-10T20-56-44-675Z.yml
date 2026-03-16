@@ -1,0 +1,21 @@
+- generic [ref=e3]:
+  - banner [ref=e6]:
+    - button "Main menu" [ref=e11] [cursor=pointer]:
+      - img [ref=e12]
+  - generic [ref=e15]:
+    - heading "e-KHNP Automation (M5 Workflow Prototype)" [level=1] [ref=e20]:
+      - text: e-KHNP Automation (M5 Workflow Prototype)
+      - generic [ref=e21]:
+        - link "Link to heading":
+          - /url: "#e-khnp-automation-m5-workflow-prototype"
+          - img
+    - paragraph [ref=e59]: "고정 모드: 관리자"
+    - generic [ref=e61]:
+      - paragraph [ref=e65]: 관리자 비밀번호
+      - generic [ref=e67]:
+        - textbox "관리자 비밀번호" [ref=e68]:
+          - /placeholder: 관리자 코드
+        - button "Show password text" [ref=e69] [cursor=pointer]:
+          - img "Show password text" [ref=e70]
+    - button "관리자 잠금 해제" [ref=e74] [cursor=pointer]:
+      - paragraph [ref=e78]: 관리자 잠금 해제
